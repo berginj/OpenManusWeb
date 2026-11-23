@@ -192,6 +192,11 @@ when available, and **Show recorded data** retains the longer excerpt.
 Use **Append log excerpt** to add recent log entries or search the selected
 task's current log for a phrase, with neighboring entries for context. The
 excerpt is bounded; rotated log files are not included.
+After execution, the report includes observed added, removed, and modified
+workspace paths based on file size and modification time. Scans are bounded and
+exclude links and common dependency directories. They can miss changes and can
+include changes made by other processes; they do not inspect file contents.
+If either scan is incomplete, additions and removals are not inferred.
 **Show recorded data** includes additional recent events and metrics. Completed reports are saved locally and can be
 reopened from the report menu. **Open task in chat** restores its workspace,
 saved usage, and available conversation excerpts for a follow-up. Review the contents for private information

@@ -38,6 +38,7 @@ from app.web.log_handler import capture_session_logs, get_logs
 from app.web.log_parser import get_all_logs_info, get_latest_log_info, parse_log_file
 from app.web.thinking_tracker import ThinkingTracker
 from app.web.task_log_excerpt import read_log_excerpt
+from app.web.workspace_changes import snapshot_workspace, compare_workspace_snapshots
 
 
 # 控制是否自动打开浏览器 (读取环境变量，默认为True)
@@ -356,6 +357,7 @@ async def get_chat_diagnostics(session_id: str, refresh_model: bool = False):
         "error_traceback": session.get('error_traceback'),
         "workspace": session.get("workspace"),
         "project_path": session.get("project_path"),
+        "workspace_changes": session.get("workspace_changes"),
         "requested_mode": session.get('requested_mode', 'auto'),
         "runtime_environment": session.get('runtime_environment'),
         "model_load": agent_monitor.cached_model_status(session.get('model'), config.llm['default'].base_url),
@@ -965,6 +967,7 @@ async def _process_prompt(session_id: str, prompt: str):
     os.environ["OPENMANUS_TASK_ID"] = job_id
 
     task_log_sink = None
+    workspace_before = None
     try:
         task_log_sink = logger.add(str(task_log_path), rotation="100 MB")
         # 使用日志捕获上下文管理器解析日志级别和内容
@@ -1062,10 +1065,7 @@ async def _process_prompt(session_id: str, prompt: str):
                 active_sessions[session_id]["result"] = "Processing stopped by user"
                 return
 
-            # 执行前检查工作区已有文件
-            existing_files = set()
-            for ext in ["*.txt", "*.md", "*.html", "*.css", "*.js", "*.py", "*.json"]:
-                existing_files.update(f.name for f in workspace_dir.glob(ext))
+            workspace_before = await asyncio.to_thread(snapshot_workspace, workspace_dir)
 
             # 跟踪计划创建过程
             if complexity in ('complex', 'planned'):
@@ -1097,21 +1097,6 @@ async def _process_prompt(session_id: str, prompt: str):
                 active_sessions[session_id]['result'] = 'Processing stopped by user'
                 return
 
-            # 执行结束后检查新生成的文件
-            new_files = set()
-            for ext in ["*.txt", "*.md", "*.html", "*.css", "*.js", "*.py", "*.json"]:
-                new_files.update(f.name for f in workspace_dir.glob(ext))
-            newly_created = new_files - existing_files
-
-            if newly_created:
-                files_list = ", ".join(newly_created)
-                ThinkingTracker.add_thinking_step(
-                    session_id,
-                    f"Generated {len(newly_created)} files in workspace {workspace_dir.name}: {files_list}",
-                )
-                # 将文件列表也添加到会话结果中
-                active_sessions[session_id]["generated_files"] = list(newly_created)
-
             # 记录完成情况
             log.info("Processing completed")
             ThinkingTracker.add_conclusion(
@@ -1134,6 +1119,12 @@ async def _process_prompt(session_id: str, prompt: str):
         # 处理错误情况
         record_task_failure(session_id, e, 'Processing error')
     finally:
+        if workspace_before is not None:
+            try:
+                workspace_after = await asyncio.to_thread(snapshot_workspace, workspace_dir)
+                active_sessions[session_id]['workspace_changes'] = compare_workspace_snapshots(workspace_before, workspace_after)
+            except Exception as exc:
+                active_sessions[session_id]['workspace_changes'] = {'error': str(exc)}
         if task_log_sink is not None:
             logger.remove(task_log_sink)
         agent_monitor.finish_task(session_id, active_sessions.get(session_id, {}).get('status', 'error'))

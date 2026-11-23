@@ -13,6 +13,38 @@ from app.web.log_handler import capture_session_logs, clear_logs, get_logs
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_failed_task_saves_workspace_changes(self):
+        sid = 'changes-test'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace, logs = root / 'workspace', root / 'logs'
+            project = workspace / 'job_test'
+            (project / 'nested').mkdir(parents=True)
+            (project / 'nested' / 'existing').write_text('before')
+            logs.mkdir()
+            session = {'status': 'processing', 'prompt': 'test', 'result': None,
+                       'workspace': 'job_test', 'project_path': None, 'requested_mode': 'direct',
+                       'model': web.config.llm['default'].model}
+
+            class FailingAgent:
+                async def run(self, *args, **kwargs):
+                    (project / 'nested' / 'existing').write_text('after longer')
+                    (project / 'nested' / 'new').write_text('created')
+                    raise RuntimeError('failed after writing')
+
+            with patch.object(web, 'WORKSPACE_ROOT', workspace), patch.object(web, 'LOGS_DIR', logs), \
+                    patch.object(web, 'active_sessions', {sid: session}), \
+                    patch.object(web, 'cancel_events', {sid: asyncio.Event()}), \
+                    patch.object(web.agent_monitor, 'DB', root / 'metrics.sqlite'), \
+                    patch.object(web.agent_monitor, 'RUNS', {}), patch.object(web, 'Manus', FailingAgent):
+                web.agent_monitor.begin_task(sid, session['model'])
+                asyncio.run(web.process_prompt(sid, 'test'))
+                report = web.agent_monitor.load_report(sid)
+                self.assertEqual(report['status'], 'error')
+                self.assertEqual(report['workspace_changes']['added']['paths'], ['nested/new'])
+                self.assertEqual(report['workspace_changes']['modified']['paths'], ['nested/existing'])
+            web.ThinkingTracker.clear_session(sid)
+
     def test_task_initialization_failure_is_saved_with_traceback(self):
         sid = 'failure-test'
         with tempfile.TemporaryDirectory() as directory:

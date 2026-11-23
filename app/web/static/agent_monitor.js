@@ -63,6 +63,21 @@
       lines.push('', `TRACEBACK (${report.error_phase || 'task error'})`,
         trace.length > 5000 ? '[Earlier traceback omitted; see recorded data]\n' + trace.slice(-5000) : trace);
     }
+    if (report.workspace_changes) {
+      const changes = report.workspace_changes;
+      lines.push('', 'OBSERVED WORKSPACE METADATA CHANGES');
+      if (changes.error) lines.push(`Scan failed: ${cut(changes.error, 500)}`);
+      else {
+        if (!changes.complete) lines.push('Scan incomplete; added and removed paths could not be determined.');
+        for (const kind of ['added', 'modified', 'removed']) {
+          const group = changes[kind];
+          if (!group) continue;
+          lines.push(`${kind}: ${group.count}${group.count > group.paths.length ? ` (showing ${group.paths.length})` : ''}`,
+            ...group.paths.map(path => `- ${cut(path, 500)}`));
+        }
+        lines.push('Metadata comparison can miss changes and include changes made outside this task. Scans are bounded; links and common dependency directories are excluded.');
+      }
+    }
     if (report.context_exchanges?.length) {
       lines.push('', 'PREVIOUS CONTEXT INCLUDED', ...report.context_exchanges.map(x =>
         `- ${x.session_id} (${x.status}): ${cut(x.request, 500)}\n  Result: ${cut(x.result, 1000)}`));
