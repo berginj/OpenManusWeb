@@ -193,6 +193,14 @@ def end_tool(tool, result=None, state='returned'):
         run['stage'] = 'agent_work'
         run['last_activity'] = time.time()
 
+def note_tool_error(message, trace=None):
+    run = RUNS.get(TASK_ID.get())
+    tool = run.get('active_tool') if run else None
+    if tool is not None:
+        tool['error'] = _tool_excerpt(message)
+        if trace:
+            tool['error_traceback'] = _tool_excerpt(trace, 4000)
+
 def start_call(model):
     sid = TASK_ID.get()
     run = RUNS.get(sid)
@@ -262,11 +270,11 @@ def fail_call(call, cancelled=False):
 
 def finish_task(sid, status):
     run = RUNS.get(sid)
-    if run is None or run['status'] != 'processing':
+    if run is None or (run['status'] != 'processing' and status != 'error'):
         return
     run['status'] = status
     run['stage'] = status
-    run['finished_at'] = time.time()
+    run['finished_at'] = run.get('finished_at') or time.time()
     c = None
     try:
         c = _conn()

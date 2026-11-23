@@ -187,6 +187,8 @@ Use **Prepare troubleshooting report** to review, edit, and copy a concise
 handoff with the task, progress, usage, result, and recent warnings or errors.
 The handoff also includes excerpts of recent tool inputs and outputs; those can
 contain project data, so edit them before copying if needed.
+When a task or tool raises an error, the handoff includes a bounded traceback
+when available, and **Show full data** retains the longer excerpt.
 **Show full data** includes additional recent events and metrics. Completed reports are saved locally and can be
 reopened from the report menu. **Open task in chat** restores its workspace,
 saved usage, and available conversation excerpts for a follow-up. Review the contents for private information

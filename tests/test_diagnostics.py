@@ -1,5 +1,7 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +13,30 @@ from app.web.log_handler import capture_session_logs, clear_logs, get_logs
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_task_initialization_failure_is_saved_with_traceback(self):
+        sid = 'failure-test'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace, logs = root / 'workspace', root / 'logs'
+            (workspace / 'job_test').mkdir(parents=True)
+            logs.mkdir()
+            session = {'status': 'processing', 'prompt': 'test', 'result': None,
+                       'workspace': 'job_test', 'project_path': None,
+                       'model': web.config.llm['default'].model}
+            with patch.object(web, 'WORKSPACE_ROOT', workspace), patch.object(web, 'LOGS_DIR', logs), \
+                    patch.object(web, 'active_sessions', {sid: session}), \
+                    patch.object(web, 'cancel_events', {sid: asyncio.Event()}), \
+                    patch.object(web.agent_monitor, 'DB', root / 'metrics.sqlite'), \
+                    patch.object(web.agent_monitor, 'RUNS', {}), \
+                    patch.object(web, 'Manus', side_effect=RuntimeError('agent initialization failed')):
+                web.agent_monitor.begin_task(sid, session['model'])
+                asyncio.run(web.process_prompt(sid, 'test'))
+                report = web.agent_monitor.load_report(sid)
+                self.assertEqual(report['status'], 'error')
+                self.assertIn('RuntimeError: agent initialization failed', report['error_traceback'])
+                self.assertEqual(web.agent_monitor.history()[0]['status'], 'error')
+            web.ThinkingTracker.clear_session(sid)
+
     def test_runtime_environment_omits_endpoint_credentials_and_query(self):
         settings = SimpleNamespace(base_url='http://alice:secret@localhost:11434/v1?token=secret',
                                    api_type='ollama', max_tokens=123, temperature=0,

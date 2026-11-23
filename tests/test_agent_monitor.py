@@ -117,6 +117,17 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual((row['input_reported_calls'], row['output_reported_calls']), (1, 1))
         self.assertGreaterEqual(row['measured_output_seconds'], 0)
 
+    def test_cleanup_failure_changes_completed_history_to_error(self):
+        monitor.begin_task('task', 'model')
+        monitor.finish_task('task', 'completed')
+        finished_at = monitor.snapshot('task')['finished_at']
+        monitor.finish_task('task', 'error')
+        self.assertEqual(monitor.snapshot('task')['status'], 'error')
+        self.assertEqual(monitor.snapshot('task')['finished_at'], finished_at)
+        self.assertEqual(monitor.history()[0]['status'], 'error')
+        monitor.finish_task('task', 'completed')
+        self.assertEqual(monitor.history()[0]['status'], 'error')
+
     def test_active_tool_is_visible_and_cleared(self):
         monitor.begin_task('task', 'model')
         token = monitor.enter_task('task')

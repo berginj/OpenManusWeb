@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.llm import LLM, _await_model_operation
 from app.agent.toolcall import ToolCallAgent
@@ -9,6 +9,39 @@ from app.web import agent_monitor as monitor
 
 
 class ModelCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_reported_failure_is_captured(self):
+        agent = ToolCallAgent()
+        command = SimpleNamespace(function=SimpleNamespace(name='create_chat_completion', arguments='{}'))
+        failure = {'success': False, 'observation': 'execution timed out'}
+        with patch.object(monitor, 'RUNS', {}), \
+                patch.object(agent.available_tools, 'execute', new=AsyncMock(return_value=failure)):
+            monitor.begin_task('task', 'test')
+            token = monitor.enter_task('task')
+            try:
+                await agent.execute_tool(command)
+                event = monitor.snapshot('task')['tool_events'][-1]
+                self.assertEqual(event['error'], 'execution timed out')
+                self.assertNotIn('error_traceback', event)
+            finally:
+                monitor.leave_task(token)
+
+    async def test_handled_tool_failure_keeps_traceback_for_report(self):
+        agent = ToolCallAgent()
+        command = SimpleNamespace(function=SimpleNamespace(name='create_chat_completion', arguments='{}'))
+        with patch.object(monitor, 'RUNS', {}), \
+                patch.object(agent.available_tools, 'execute', new=AsyncMock(side_effect=ValueError('invalid input'))):
+            monitor.begin_task('task', 'test')
+            token = monitor.enter_task('task')
+            try:
+                result = await agent.execute_tool(command)
+                event = monitor.snapshot('task')['tool_events'][-1]
+                self.assertIn('invalid input', result)
+                self.assertIn('invalid input', event['error'])
+                self.assertIn('ValueError: invalid input', event['error_traceback'])
+                self.assertEqual(event['state'], 'returned')
+            finally:
+                monitor.leave_task(token)
+
     async def test_active_tool_is_cleared_when_execution_fails(self):
         started, release = asyncio.Event(), asyncio.Event()
 

@@ -27,6 +27,12 @@
       const text = String(value ?? 'Not available');
       return text.length > max ? text.slice(0, max) + `\n[${text.length - max} characters omitted; see full data]` : text;
     };
+    const cutMiddle = (value, max = 1000) => {
+      const text = String(value ?? 'Not available');
+      if (text.length <= max) return text;
+      const half = Math.floor(max / 2);
+      return text.slice(0, half) + `\n[${text.length - max} characters omitted; see full data]\n` + text.slice(-(max - half));
+    };
     const m = report.metrics || {}, p = report.progress || {}, call = m.active_call;
     const lines = ['OpenManus troubleshooting report', `Task ID: ${report.session_id}`,
       `Status: ${report.status}`, `Workspace: ${report.project_path || report.workspace || 'Not available'}`,
@@ -52,6 +58,11 @@
       lines.push('The server stopped before completion; the task was not resumed.');
     }
     lines.push('', 'REQUEST', cut(report.prompt, 4000), '', 'RESULT / ERROR', cut(report.result, 4000));
+    if (report.error_traceback) {
+      const trace = String(report.error_traceback);
+      lines.push('', `TRACEBACK (${report.error_phase || 'task error'})`,
+        trace.length > 5000 ? '[Earlier traceback omitted; see full data]\n' + trace.slice(-5000) : trace);
+    }
     if (report.context_exchanges?.length) {
       lines.push('', 'PREVIOUS CONTEXT INCLUDED', ...report.context_exchanges.map(x =>
         `- ${x.session_id} (${x.status}): ${cut(x.request, 500)}\n  Result: ${cut(x.result, 1000)}`));
@@ -65,6 +76,11 @@
         lines.push(`- ${tool.name} (${tool.state}${Number.isFinite(tool.elapsed) ? `, ${seconds(tool.elapsed)}` : ''})`,
           `  Input: ${cut(tool.arguments || '(none)', 1000)}`,
           `  Output: ${tool.state === 'running' ? '(still running)' : cut(tool.result || '(none)', 1000)}`);
+        if (tool.error) lines.push(`  Tool reported error: ${cutMiddle(tool.error, 1000)}`);
+        if (tool.error_traceback) {
+          const trace = String(tool.error_traceback);
+          lines.push('  Tool traceback:', trace.length > 2500 ? '[Earlier traceback omitted; see full data]\n' + trace.slice(-2500) : trace);
+        }
       }
     }
     const important = report.important_logs || (report.recent_session_logs || []).filter(l => ['WARNING','ERROR','CRITICAL'].includes(l.level));

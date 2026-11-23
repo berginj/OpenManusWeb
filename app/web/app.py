@@ -5,6 +5,7 @@ import platform
 import re
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from pathlib import Path
@@ -345,6 +346,8 @@ async def get_chat_diagnostics(session_id: str, refresh_model: bool = False):
         "prompt": bounded(session.get("prompt"), 8000),
         "status": session["status"],
         "result": session.get("result"),
+        "error_phase": session.get('error_phase'),
+        "error_traceback": session.get('error_traceback'),
         "workspace": session.get("workspace"),
         "project_path": session.get("project_path"),
         "requested_mode": session.get('requested_mode', 'auto'),
@@ -824,6 +827,23 @@ async def choose_execution(prompt: str, exchanges: list, mode: str):
     return complexity, review
 
 
+def record_task_failure(session_id: str, exc: Exception, phase: str):
+    """Keep a bounded traceback alongside the short message shown in chat."""
+    trace = traceback.format_exc()
+    if len(trace) > 12000:
+        omitted = len(trace) - 12000
+        trace = trace[:6000] + f'\n[{omitted} characters omitted]\n' + trace[-6000:]
+    session = active_sessions[session_id]
+    session['status'] = 'error'
+    session['result'] = f'{phase}: {exc}'
+    session['error_phase'] = phase
+    session['error_traceback'] = trace
+    if ThinkingTracker.get_status(session_id) == 'pending':
+        ThinkingTracker.start_tracking(session_id)
+    ThinkingTracker.add_error(session_id, f'{phase}: {exc}')
+    logger.error('{}\n{}', session['result'], trace)
+
+
 async def process_prompt(session_id: str, prompt: str):
     """Ensure setup failures do not leave a task permanently marked as running."""
     original_cwd = os.getcwd()
@@ -831,10 +851,9 @@ async def process_prompt(session_id: str, prompt: str):
         await _process_prompt(session_id, prompt)
     except Exception as exc:
         os.chdir(original_cwd)
-        session = active_sessions[session_id]
-        session['status'] = 'error'
-        session['result'] = f'Task setup or cleanup failed: {exc}'
+        record_task_failure(session_id, exc, 'Task setup or cleanup failed')
         agent_monitor.finish_task(session_id, 'error')
+        cancel_events.pop(session_id, None)
         try:
             agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
         except Exception as report_exc:
@@ -1089,11 +1108,7 @@ async def _process_prompt(session_id: str, prompt: str):
         active_sessions[session_id]["result"] = "Processing canceled"
     except Exception as e:
         # 处理错误情况
-        error_msg = f"Processing error: {str(e)}"
-        print(error_msg)
-        ThinkingTracker.add_error(session_id, f"Processing encountered an error: {str(e)}")
-        active_sessions[session_id]["status"] = "error"
-        active_sessions[session_id]["result"] = f"Error: {str(e)}"
+        record_task_failure(session_id, e, 'Processing error')
     finally:
         if task_log_sink is not None:
             logger.remove(task_log_sink)

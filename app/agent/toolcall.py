@@ -1,5 +1,6 @@
 import asyncio
 import json
+import traceback
 from typing import Any, List, Literal
 
 from pydantic import Field
@@ -147,10 +148,12 @@ class ToolCallAgent(ReActAgent):
     async def _execute_tool(self, command: ToolCall) -> str:
         """Execute a single tool call with robust error handling"""
         if not command or not command.function or not command.function.name:
+            agent_monitor.note_tool_error('Invalid command format')
             return "Error: Invalid command format"
 
         name = command.function.name
         if name not in self.available_tools.tool_map:
+            agent_monitor.note_tool_error(f"Unknown tool '{name}'")
             return f"Error: Unknown tool '{name}'"
 
         try:
@@ -160,6 +163,10 @@ class ToolCallAgent(ReActAgent):
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
             result = await self.available_tools.execute(name=name, tool_input=args)
+            if isinstance(result, dict) and result.get('success') is False:
+                agent_monitor.note_tool_error(result.get('observation', 'Tool reported failure'))
+            elif getattr(result, 'error', None):
+                agent_monitor.note_tool_error(result.error)
 
             # Format result for display
             observation = (
@@ -174,12 +181,14 @@ class ToolCallAgent(ReActAgent):
             return observation
         except json.JSONDecodeError:
             error_msg = f"Error parsing arguments for {name}: Invalid JSON format"
+            agent_monitor.note_tool_error(error_msg, traceback.format_exc())
             logger.error(
                 f"📝 Oops! The arguments for '{name}' don't make sense - invalid JSON, arguments:{command.function.arguments}"
             )
             return f"Error: {error_msg}"
         except Exception as e:
             error_msg = f"⚠️ Tool '{name}' encountered a problem: {str(e)}"
+            agent_monitor.note_tool_error(error_msg, traceback.format_exc())
             logger.error(error_msg)
             return f"Error: {error_msg}"
 
