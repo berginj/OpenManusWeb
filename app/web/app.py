@@ -314,6 +314,14 @@ async def project_files(session_id: str, path: str = ''):
         raise HTTPException(status_code=400, detail='File cannot be read as UTF-8 text')
 
 
+def public_task_status(session_id: str, session: dict) -> str:
+    """Do not publish a terminal status until task cleanup has finished."""
+    run = agent_monitor.RUNS.get(session_id)
+    if run and run.get('status') == 'processing':
+        return 'processing'
+    return session['status']
+
+
 @app.get("/api/chat/{session_id}")
 async def get_chat_result(session_id: str):
     if session_id not in active_sessions:
@@ -323,7 +331,8 @@ async def get_chat_result(session_id: str):
     session = active_sessions[session_id]
     session["log"] = get_logs(session_id)
 
-    return session
+    status = public_task_status(session_id, session)
+    return {**session, 'status': status, 'result': session.get('result') if status != 'processing' else None}
 
 
 @app.get("/api/chat/{session_id}/diagnostics")
@@ -351,7 +360,7 @@ async def get_chat_diagnostics(session_id: str, refresh_model: bool = False):
     return {
         "session_id": session_id,
         "prompt": bounded(session.get("prompt"), 8000),
-        "status": session["status"],
+        "status": public_task_status(session_id, session),
         "result": session.get("result"),
         "error_phase": session.get('error_phase'),
         "error_traceback": session.get('error_traceback'),
@@ -442,8 +451,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         await websocket.send_text(
             json.dumps(
                 {
-                    "status": session["status"],
-                    "result": session["result"],
+                    "status": public_task_status(session_id, session),
+                    "result": session["result"] if public_task_status(session_id, session) != 'processing' else None,
                     "log": initial_session_logs,
                     "thinking_steps": initial_steps,
                     "logs": initial_logs,
@@ -471,9 +480,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         last_log_count = len(initial_session_logs)
         last_thinking_step_count = len(initial_steps)
         last_tracker_log_count = len(initial_logs)
-        result_sent = session['status'] != 'processing'
+        result_sent = public_task_status(session_id, session) != 'processing'
 
-        while session["status"] == "processing":
+        while public_task_status(session_id, session) == "processing":
             await asyncio.sleep(0.2)  # 降低检查间隔提高实时性
 
             # 检查系统日志更新 (新增)
@@ -484,7 +493,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     await websocket.send_text(
                         json.dumps(
                             {
-                                "status": session["status"],
+                                "status": public_task_status(session_id, session),
                                 "system_logs": new_logs,
                                 # 添加一个chat_logs字段，将系统日志作为聊天消息发送
                                 "chat_logs": new_logs,
@@ -499,7 +508,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await websocket.send_text(
                     json.dumps(
                         {
-                            "status": session["status"],
+                            "status": public_task_status(session_id, session),
                             "log": session["log"][last_log_count:],
                         }
                     )
@@ -513,7 +522,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await websocket.send_text(
                     json.dumps(
                         {
-                            "status": session["status"],
+                            "status": public_task_status(session_id, session),
                             "thinking_steps": thinking_steps[last_thinking_step_count:],
                         }
                     )
@@ -527,7 +536,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await websocket.send_text(
                     json.dumps(
                         {
-                            "status": session["status"],
+                            "status": public_task_status(session_id, session),
                             "logs": tracker_logs[last_tracker_log_count:],
                         }
                     )
@@ -535,7 +544,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 last_tracker_log_count = current_tracker_log_count
 
             # 检查结果更新
-            if session["result"]:
+            if public_task_status(session_id, session) != 'processing' and session["result"]:
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -878,8 +887,9 @@ async def process_prompt(session_id: str, prompt: str):
     except Exception as exc:
         os.chdir(original_cwd)
         record_task_failure(session_id, exc, 'Task setup or cleanup failed')
-        agent_monitor.finish_task(session_id, 'error')
         cancel_events.pop(session_id, None)
+    finally:
+        agent_monitor.finish_task(session_id, active_sessions.get(session_id, {}).get('status', 'error'))
         try:
             agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
         except Exception as report_exc:
@@ -1127,11 +1137,6 @@ async def _process_prompt(session_id: str, prompt: str):
                 active_sessions[session_id]['workspace_changes'] = {'error': str(exc)}
         if task_log_sink is not None:
             logger.remove(task_log_sink)
-        agent_monitor.finish_task(session_id, active_sessions.get(session_id, {}).get('status', 'error'))
-        try:
-            agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
-        except Exception as exc:
-            print(f'Could not save diagnostic report: {exc}')
         agent_monitor.leave_task(monitor_token)
         # 恢复原始工作目录
         os.chdir(original_cwd)

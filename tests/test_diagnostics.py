@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,88 @@ from app.web.log_handler import capture_session_logs, clear_logs, get_logs
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_websocket_waits_for_cleanup_before_sending_result(self):
+        sid = 'websocket-cleanup-test'
+        session = {'status': 'processing', 'prompt': 'test', 'result': None,
+                   'workspace': 'test', 'project_path': None, 'log': [],
+                   'model': web.config.llm['default'].model}
+
+        class Socket:
+            def __init__(self):
+                self.messages = []
+            async def accept(self):
+                pass
+            async def send_text(self, data):
+                self.messages.append(json.loads(data))
+            async def close(self):
+                pass
+
+        async def exercise():
+            started, release = asyncio.Event(), asyncio.Event()
+            async def task_body(*args):
+                session['status'], session['result'] = 'completed', 'done'
+                started.set()
+                await release.wait()
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch.object(web, 'active_sessions', {sid: session}), \
+                    patch.object(web, 'LOGS_DIR', Path(directory)), \
+                    patch.object(web.agent_monitor, 'RUNS', {}), \
+                    patch.object(web.agent_monitor, 'DB', Path(directory) / 'metrics.sqlite'), \
+                    patch.object(web, '_process_prompt', task_body):
+                web.agent_monitor.begin_task(sid, session['model'])
+                task = asyncio.create_task(web.process_prompt(sid, 'test'))
+                await started.wait()
+                socket = Socket()
+                connection = asyncio.create_task(web.websocket_endpoint(socket, sid))
+                await asyncio.sleep(0.3)
+                self.assertTrue(socket.messages)
+                self.assertTrue(all(message.get('status') == 'processing' for message in socket.messages))
+                self.assertTrue(all(not message.get('result') for message in socket.messages))
+                release.set()
+                await task
+                await asyncio.wait_for(connection, 2)
+                self.assertEqual(socket.messages[-1]['status'], 'completed')
+                self.assertEqual(socket.messages[-1]['result'], 'done')
+        asyncio.run(exercise())
+
+    def test_terminal_status_waits_for_cleanup(self):
+        sid = 'cleanup-test'
+        session = {'status': 'processing', 'prompt': 'test', 'result': None,
+                   'workspace': 'test', 'project_path': None,
+                   'model': web.config.llm['default'].model}
+
+        async def exercise():
+            cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+
+            async def task_body(*args):
+                session['status'], session['result'] = 'completed', 'done'
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch.object(web, 'active_sessions', {sid: session}), \
+                    patch.object(web.agent_monitor, 'RUNS', {}), \
+                    patch.object(web.agent_monitor, 'DB', Path(directory) / 'metrics.sqlite'), \
+                    patch.object(web, '_process_prompt', task_body):
+                web.agent_monitor.begin_task(sid, session['model'])
+                task = asyncio.create_task(web.process_prompt(sid, 'test'))
+                await cleanup_started.wait()
+                response = await web.get_chat_result(sid)
+                self.assertEqual(response['status'], 'processing')
+                self.assertIsNone(response['result'])
+                self.assertEqual((await web.get_chat_diagnostics(sid))['status'], 'processing')
+                with self.assertRaises(HTTPException) as raised:
+                    await web.create_chat_session(web.SessionRequest(prompt='next'), BackgroundTasks())
+                self.assertEqual(raised.exception.status_code, 409)
+                release_cleanup.set()
+                await task
+                response = await web.get_chat_result(sid)
+                self.assertEqual(response['status'], 'completed')
+                self.assertEqual(response['result'], 'done')
+                self.assertEqual(web.agent_monitor.load_report(sid)['status'], 'completed')
+
+        asyncio.run(exercise())
+
     def test_failed_task_saves_workspace_changes(self):
         sid = 'changes-test'
         with tempfile.TemporaryDirectory() as directory:
