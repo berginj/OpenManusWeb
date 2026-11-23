@@ -217,7 +217,8 @@ class App {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({ prompt: message, model: document.getElementById('monitor-model')?.value || null,
-                    workspace, project_path: projectPath, previous_session_id: previousSessionId }),
+                    workspace, project_path: projectPath, previous_session_id: previousSessionId,
+                    execution_mode: document.getElementById('execution-mode').value }),
             });
 
             if (!response.ok) {

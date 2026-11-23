@@ -151,6 +151,10 @@ Follow-up tasks in the same workspace include excerpts from up to three prior
 linked task requests and results by default. Uncheck **Include up to 3 previous
 task exchanges** to start without that context. The included excerpts appear
 in the troubleshooting report, and long excerpts are truncated.
+Automatic execution sends clearly simple greetings and single arithmetic
+expressions directly; other tasks receive a preliminary review. Choose **Direct**
+to skip review and planning or **Create a plan** to request planning explicitly.
+These manual routes maintain separate timing history from automatic routing.
 
 The monitor shows model calls, reported input and output tokens, estimated
 streamed output where exact counts are unavailable, elapsed time, and plan

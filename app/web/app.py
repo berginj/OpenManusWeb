@@ -8,7 +8,7 @@ import time
 import uuid
 import webbrowser
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Literal
 from urllib.parse import urlsplit
 
 from fastapi import (
@@ -100,6 +100,7 @@ class SessionRequest(BaseModel):
     workspace: str | None = None
     project_path: str | None = None
     previous_session_id: str | None = None
+    execution_mode: Literal['auto', 'direct', 'plan'] = 'auto'
 
 
 def runtime_environment():
@@ -244,6 +245,7 @@ async def create_chat_session(
         "log": [],
         "workspace": None,
         "model": chosen_model,
+        "requested_mode": session_req.execution_mode,
         "runtime_environment": runtime_environment(),
         "previous_session_id": session_req.previous_session_id,
         "context_exchanges": exchanges,
@@ -345,6 +347,7 @@ async def get_chat_diagnostics(session_id: str, refresh_model: bool = False):
         "result": session.get("result"),
         "workspace": session.get("workspace"),
         "project_path": session.get("project_path"),
+        "requested_mode": session.get('requested_mode', 'auto'),
         "runtime_environment": session.get('runtime_environment'),
         "model_load": agent_monitor.cached_model_status(session.get('model'), config.llm['default'].base_url),
         "previous_session_id": session.get('previous_session_id'),
@@ -792,6 +795,9 @@ async def review_task(prompt: str, exchanges=None):
     """Review scope before choosing execution mode; keep obvious greetings cheap."""
     if re.fullmatch(r'\s*(hi|hello|hey|thanks|thank you)[!.?\s]*', prompt, re.I):
         return 'simple', 'Brief greeting; direct execution.'
+    number = r'[+-]?\d+(?:\.\d+)?'
+    if re.fullmatch(rf'\s*(?:(?:what\s+is|calculate|compute|evaluate)\s+)?{number}\s*(?:[+*/×÷-]|plus|minus|times|divided\s+by)\s*{number}\s*[?.!]?\s*', prompt, re.I):
+        return 'simple', 'Single arithmetic expression; direct execution.'
     try:
         response = await asyncio.wait_for(LLM().ask(
             messages=[Message.user_message(prompt_with_context(prompt, exchanges or []))],
@@ -807,6 +813,15 @@ async def review_task(prompt: str, exchanges=None):
     except Exception as exc:
         return 'complex', f'Review unavailable ({type(exc).__name__}); using planned execution.'
     return 'complex', 'Review was inconclusive; using planned execution.'
+
+
+async def choose_execution(prompt: str, exchanges: list, mode: str):
+    if mode == 'direct':
+        return 'direct', 'Direct execution selected; automatic review skipped.'
+    complexity, review = await review_task(prompt, exchanges)
+    if mode == 'plan':
+        return 'planned', f'Planning selected by user. Review: {review}'
+    return complexity, review
 
 
 async def process_prompt(session_id: str, prompt: str):
@@ -980,9 +995,10 @@ async def _process_prompt(session_id: str, prompt: str):
                 # 替换原始LLM
                 agent.llm = wrapped_llm
 
-            ThinkingTracker.add_thinking_step(session_id, "Reviewing task scope")
             exchanges = active_sessions[session_id].get('context_exchanges', [])
-            complexity, review = await review_task(prompt, exchanges)
+            mode = active_sessions[session_id].get('requested_mode', 'auto')
+            ThinkingTracker.add_thinking_step(session_id, "Direct execution selected" if mode == 'direct' else "Reviewing task scope")
+            complexity, review = await choose_execution(prompt, exchanges, mode)
             agent_monitor.set_review(session_id, complexity, review, prompt)
             ThinkingTracker.add_thinking_step(session_id, f"Task review ({complexity}): {review}")
             if exchanges:
@@ -1009,7 +1025,7 @@ async def _process_prompt(session_id: str, prompt: str):
                 existing_files.update(f.name for f in workspace_dir.glob(ext))
 
             # 跟踪计划创建过程
-            if complexity == 'complex':
+            if complexity in ('complex', 'planned'):
                 ThinkingTracker.add_thinking_step(session_id, "Creating task execution plan")
 
             # 获取取消事件以传递给flow.execute
@@ -1024,7 +1040,7 @@ async def _process_prompt(session_id: str, prompt: str):
                 return
 
             # 执行实际处理 - 传递job_id和cancel_event给flow.execute方法
-            if complexity == 'simple':
+            if complexity in ('simple', 'direct'):
                 ThinkingTracker.add_thinking_step(session_id, "Executing directly")
                 agent.finish_on_text = True
                 result = await agent.run(prompt_with_context(prompt, exchanges), cancel_event=cancel_event)

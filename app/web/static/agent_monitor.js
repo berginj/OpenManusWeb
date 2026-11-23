@@ -30,12 +30,14 @@
     const m = report.metrics || {}, p = report.progress || {}, call = m.active_call;
     const lines = ['OpenManus troubleshooting report', `Task ID: ${report.session_id}`,
       `Status: ${report.status}`, `Workspace: ${report.project_path || report.workspace || 'Not available'}`,
+      `Execution requested: ${report.requested_mode || 'auto'}; route: ${m.complexity || 'not yet reviewed'}`,
       `Model: ${m.model || 'Not available'}`, `Elapsed: ${seconds(m.elapsed)}`,
       `Current step: ${p.current_step || m.stage || 'Not available'}`,
       `Model calls: ${m.completed_calls ?? 0} completed / ${m.calls ?? 0} started; ${m.errors ?? 0} errors or retries, ${m.cancelled_calls ?? 0} canceled`,
       `Input tokens: ${m.prompt_tokens ?? 0} reported (${m.input_reported_calls ?? 0} calls); output: ${m.output_tokens ?? 0} reported, ${m.estimated_tokens ?? 0} estimated (${m.output_reported_calls ?? 0} calls reported)`,
       'Token totals may be incomplete, especially for failed or in-flight calls.'];
     if (call) lines.push(`Active model request: ${seconds(call.in_flight_seconds)} in flight; ${call.received_chunks} chunks received.`);
+    if (m.review) lines.push(`Task review: ${cut(m.review, 1000)}`);
     if (m.active_tool) lines.push(`Active tool: ${m.active_tool.name}, running for ${seconds(m.active_tool.in_flight_seconds)}.`);
     if (report.runtime_environment) {
       const env = report.runtime_environment;
@@ -147,6 +149,7 @@
         }
       }
       select.disabled = active;
+      $('execution-mode').disabled = active;
       const run = d.run;
       $('monitor-backend').textContent = d.error ? `Ollama not reachable: ${d.error}` :
         `Ollama online · ${d.loaded.length} loaded · ${d.models.length} installed`;

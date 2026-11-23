@@ -551,6 +551,7 @@
           <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;justify-content:space-between">
             <div><h2 style="margin-bottom:2px">Local inference monitor</h2><small id="monitor-backend">Checking Ollama...</small></div>
             <label style="font-size:14px">Model for next task: <select id="monitor-model" style="padding:7px;margin-left:6px;max-width:280px"></select></label>
+            <label style="font-size:14px">Execution: <select id="execution-mode" style="padding:7px;margin-left:6px"><option value="auto">Automatic review</option><option value="direct">Direct, skip review and plan</option><option value="plan">Create a plan</option></select></label>
             <label style="font-size:14px">Workspace for next task: <select id="task-workspace" style="padding:7px;margin-left:6px;max-width:220px"><option value="">New workspace</option></select></label>
           </div>
           <div style="margin-top:8px"><label for="project-path">Or work in a local project folder (absolute path):</label> <input id="project-path" type="text" style="width:min(100%,420px)" placeholder="C:\path\to\project"> <small>Tasks can read and modify files in this folder.</small></div>
