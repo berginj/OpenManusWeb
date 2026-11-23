@@ -8,20 +8,25 @@ export class WebSocketManager {
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 1000; // 初始重连延迟1秒
         this.sessionId = null;
+        this.reconnectTimer = null;
     }
 
     // 连接WebSocket
-    connect(sessionId) {
+    connect(sessionId, reconnecting = false) {
+        clearTimeout(this.reconnectTimer);
         // 保存会话ID
         this.sessionId = sessionId;
 
         // 如果已经有连接，先关闭
         if (this.socket) {
+            this.socket.onclose = null;
+            this.socket.onmessage = null;
+            this.socket.onopen = null;
             this.socket.close();
         }
 
         // 重置重连尝试次数
-        this.reconnectAttempts = 0;
+        if (!reconnecting) this.reconnectAttempts = 0;
 
         // 创建WebSocket连接
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -43,13 +48,16 @@ export class WebSocketManager {
         console.log('WebSocket连接已建立');
         document.getElementById('status-indicator').textContent = '已连接到服务器...';
         // 重置重连尝试次数
-        this.reconnectAttempts = 0;
+        // Keep the retry count until a new task starts.
     }
 
     // 处理接收到的消息
     handleMessage(event) {
         try {
             const data = JSON.parse(event.data);
+            if (['completed', 'error', 'stopped'].includes(data.status) && data.result != null) {
+                this.sessionId = null;
+            }
             console.log('收到WebSocket消息:', data);
 
             // 调用消息处理回调
@@ -93,9 +101,10 @@ export class WebSocketManager {
         console.log(`尝试重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})，延迟 ${delay}ms`);
         document.getElementById('status-indicator').textContent = `连接已断开，正在尝试重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`;
 
-        setTimeout(() => {
-            if (this.sessionId) {
-                this.connect(this.sessionId);
+        const sessionId = this.sessionId;
+        this.reconnectTimer = setTimeout(() => {
+            if (this.sessionId === sessionId) {
+                this.connect(sessionId, true);
             }
         }, delay);
     }
@@ -111,7 +120,12 @@ export class WebSocketManager {
 
     // 关闭连接
     close() {
+        this.sessionId = null;
+        clearTimeout(this.reconnectTimer);
         if (this.socket) {
+            this.socket.onclose = null;
+            this.socket.onmessage = null;
+            this.socket.onopen = null;
             this.socket.close();
             this.socket = null;
         }

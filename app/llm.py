@@ -1,3 +1,4 @@
+import asyncio
 from typing import Dict, List, Literal, Optional, Union
 
 from openai import (
@@ -13,6 +14,30 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from app.config import LLMSettings, config
 from app.logger import logger  # Assuming a logger is set up in your app
 from app.schema import Message
+from app.web import agent_monitor
+
+
+async def _await_model_operation(awaitable):
+    """Cancel an in-flight model operation when the web task is stopped."""
+    stop = agent_monitor.CANCEL_EVENT.get()
+    if stop is None:
+        return await awaitable
+    operation = asyncio.ensure_future(awaitable)
+    stop_waiter = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait((operation, stop_waiter), return_when=asyncio.FIRST_COMPLETED)
+        if stop.is_set():
+            raise asyncio.CancelledError()
+        return operation.result()
+    finally:
+        for task in (operation, stop_waiter):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(operation, stop_waiter, return_exceptions=True)
+
+
+async def _retry_sleep(seconds):
+    await _await_model_operation(asyncio.sleep(seconds))
 
 
 class LLM:
@@ -36,6 +61,7 @@ class LLM:
             self.model = llm_config.model
             self.max_tokens = llm_config.max_tokens
             self.temperature = llm_config.temperature
+            self.request_timeout_seconds = llm_config.request_timeout_seconds
             self.api_type = llm_config.api_type
             self.api_key = llm_config.api_key
             self.api_version = llm_config.api_version
@@ -100,6 +126,7 @@ class LLM:
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
+        sleep=_retry_sleep,
     )
     async def ask(
         self,
@@ -133,59 +160,81 @@ class LLM:
             else:
                 messages = self.format_messages(messages)
 
+            mon_call = agent_monitor.start_call(self.model)
             if not stream:
                 # Non-streaming request
-                response = await self.client.chat.completions.create(
+                response = await _await_model_operation(self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     max_tokens=self.max_tokens,
-                    temperature=temperature or self.temperature,
+                    temperature=self.temperature if temperature is None else temperature,
                     stream=False,
-                )
+                ))
                 if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty or invalid response from LLM")
+                agent_monitor.end_call(mon_call, getattr(response, "usage", None), response.choices[0].message.content)
                 return response.choices[0].message.content
 
             # Streaming request
-            response = await self.client.chat.completions.create(
+            response = await _await_model_operation(self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 max_tokens=self.max_tokens,
-                temperature=temperature or self.temperature,
+                temperature=self.temperature if temperature is None else temperature,
                 stream=True,
-            )
+            ))
 
             collected_messages = []
-            async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
-                collected_messages.append(chunk_message)
-                print(chunk_message, end="", flush=True)
+            try:
+                iterator = response.__aiter__()
+                while True:
+                    try:
+                        chunk = await _await_model_operation(iterator.__anext__())
+                    except StopAsyncIteration:
+                        break
+                    if not chunk.choices:
+                        continue
+                    chunk_message = chunk.choices[0].delta.content or ""
+                    collected_messages.append(chunk_message)
+                    agent_monitor.chunk(mon_call, chunk_message)
+                    print(chunk_message, end="", flush=True)
+            finally:
+                await response.close()
 
             print()  # Newline after streaming
             full_response = "".join(collected_messages).strip()
             if not full_response:
                 raise ValueError("Empty response from streaming LLM")
+            agent_monitor.end_call(mon_call)
             return full_response
 
+        except asyncio.CancelledError:
+            stop = agent_monitor.CANCEL_EVENT.get()
+            agent_monitor.fail_call(locals().get("mon_call"), cancelled=bool(stop and stop.is_set()))
+            raise
         except ValueError as ve:
+            agent_monitor.fail_call(locals().get("mon_call"))
             logger.error(f"Validation error: {ve}")
             raise
         except OpenAIError as oe:
+            agent_monitor.fail_call(locals().get("mon_call"))
             logger.error(f"OpenAI API error: {oe}")
             raise
         except Exception as e:
+            agent_monitor.fail_call(locals().get("mon_call"))
             logger.error(f"Unexpected error in ask: {e}")
             raise
 
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
+        sleep=_retry_sleep,
     )
     async def ask_tool(
         self,
         messages: List[Union[dict, Message]],
         system_msgs: Optional[List[Union[dict, Message]]] = None,
-        timeout: int = 60,
+        timeout: Optional[int] = None,
         tools: Optional[List[dict]] = None,
         tool_choice: Literal["none", "auto", "required"] = "auto",
         temperature: Optional[float] = None,
@@ -230,28 +279,40 @@ class LLM:
                         raise ValueError("Each tool must be a dict with 'type' field")
 
             # Set up the completion request
-            response = await self.client.chat.completions.create(
+            mon_call = agent_monitor.start_call(self.model)
+            response = await _await_model_operation(self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=temperature or self.temperature,
+                temperature=self.temperature if temperature is None else temperature,
                 max_tokens=self.max_tokens,
                 tools=tools,
                 tool_choice=tool_choice,
-                timeout=timeout,
+                timeout=timeout if timeout is not None else self.request_timeout_seconds,
                 **kwargs,
-            )
+            ))
 
             # Check if response is valid
             if not response.choices or not response.choices[0].message:
                 print(response)
                 raise ValueError("Invalid or empty response from LLM")
 
+            response_message = response.choices[0].message
+            output_text = response_message.content or ''
+            for tool_call in response_message.tool_calls or []:
+                output_text += tool_call.function.arguments or ''
+            agent_monitor.end_call(mon_call, getattr(response, "usage", None), output_text)
             return response.choices[0].message
 
+        except asyncio.CancelledError:
+            stop = agent_monitor.CANCEL_EVENT.get()
+            agent_monitor.fail_call(locals().get("mon_call"), cancelled=bool(stop and stop.is_set()))
+            raise
         except ValueError as ve:
+            agent_monitor.fail_call(locals().get("mon_call"))
             logger.error(f"Validation error in ask_tool: {ve}")
             raise
         except OpenAIError as oe:
+            agent_monitor.fail_call(locals().get("mon_call"))
             if isinstance(oe, AuthenticationError):
                 logger.error("Authentication failed. Check API key.")
             elif isinstance(oe, RateLimitError):
@@ -260,5 +321,6 @@ class LLM:
                 logger.error(f"API error: {oe}")
             raise
         except Exception as e:
+            agent_monitor.fail_call(locals().get("mon_call"))
             logger.error(f"Unexpected error in ask_tool: {e}")
             raise

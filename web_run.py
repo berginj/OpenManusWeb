@@ -51,7 +51,7 @@ if __name__ == "__main__":
 
     port = args.port
 
-    print(f"🚀 OpenManus Web 应用正在启动...")
-    print(f"访问 http://localhost:{port} 开始使用")
+    print("Starting OpenManus Web...")
+    print(f"Open http://localhost:{port}")
 
-    uvicorn.run("app.web.app:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app.web.app:app", host="127.0.0.1", port=port, reload=False)

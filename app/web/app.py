@@ -1,17 +1,21 @@
 import asyncio
 import json
 import os
+import platform
+import re
 import threading
 import time
 import uuid
 import webbrowser
 from pathlib import Path
 from typing import Dict
+from urllib.parse import urlsplit
 
 from fastapi import (
     BackgroundTasks,
     FastAPI,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -20,6 +24,11 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from app.config import config
+from app.llm import LLM
+from app.logger import logger
+from app.schema import Message
+from app.web import agent_monitor
 
 from app.agent.manus import Manus
 from app.flow.base import FlowType
@@ -81,12 +90,72 @@ async def startup_event():
     if AUTO_OPEN_BROWSER and not last_opened:
         # 延迟1秒以确保服务已经启动
         threading.Timer(1.0, lambda: webbrowser.open("http://localhost:8000")).start()
-        print("🌐 自动打开浏览器...")
+        print("Opening browser...")
         last_opened = True
 
 
 class SessionRequest(BaseModel):
     prompt: str
+    model: str | None = None
+    workspace: str | None = None
+    project_path: str | None = None
+    previous_session_id: str | None = None
+
+
+def runtime_environment():
+    """Capture useful settings without retaining URL credentials, path or query."""
+    settings = config.llm['default']
+    try:
+        parsed = urlsplit(settings.base_url)
+        host = parsed.hostname
+        if not parsed.scheme or not host:
+            raise ValueError('Invalid endpoint')
+        if ':' in host:
+            host = f'[{host}]'
+        origin = f'{parsed.scheme}://{host}' + (f':{parsed.port}' if parsed.port else '')
+    except (ValueError, TypeError):
+        origin = 'unavailable'
+    return {'endpoint_origin': origin, 'api_type': settings.api_type,
+            'max_output_tokens': settings.max_tokens, 'temperature': settings.temperature,
+            'request_timeout_seconds': settings.request_timeout_seconds,
+            'python_version': platform.python_version(), 'platform': platform.system(),
+            'platform_release': platform.release()}
+
+
+def previous_exchanges(session_id: str, workspace_dir: Path):
+    """Load a small, explicitly linked conversation from the same workspace."""
+    exchanges, seen = [], set()
+    while session_id and len(exchanges) < 3:
+        if session_id in seen:
+            raise HTTPException(status_code=400, detail='Conversation history contains a cycle')
+        seen.add(session_id)
+        session = active_sessions.get(session_id) or agent_monitor.load_report(session_id)
+        if not session:
+            raise HTTPException(status_code=400, detail='Previous task was not found')
+        if session.get('status') == 'processing':
+            raise HTTPException(status_code=409, detail='Previous task is still running')
+        previous_path = session.get('project_path') or (WORKSPACE_ROOT / (session.get('workspace') or ''))
+        if Path(previous_path).resolve() != workspace_dir.resolve():
+            raise HTTPException(status_code=400, detail='Previous task belongs to a different workspace')
+        def excerpt(value, limit):
+            text = str(value or '')
+            if len(text) <= limit:
+                return text
+            first = limit // 2
+            return text[:first] + '\n[Middle content truncated]\n' + text[-(limit - first):]
+        exchanges.append({'session_id': session_id, 'status': session.get('status'),
+                          'request': excerpt(session.get('prompt'), 2000),
+                          'result': excerpt(session.get('result'), 4000)})
+        session_id = session.get('previous_session_id')
+    return list(reversed(exchanges))
+
+
+def prompt_with_context(prompt: str, exchanges: list) -> str:
+    if not exchanges:
+        return prompt
+    return ('Previous exchanges in this workspace (excerpts; inspect files when needed):\n'
+            + json.dumps(exchanges, ensure_ascii=False, indent=2)
+            + '\n\nCurrent user request:\n' + prompt)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -115,32 +184,124 @@ async def get_connected_interface(request: Request):
     )
 
 
+@app.get("/api/agent-monitor")
+async def agent_monitor_api(session_id: str = ""):
+    details = await asyncio.to_thread(agent_monitor.ollama_models, config.llm['default'].base_url)
+    run = agent_monitor.snapshot(session_id or None)
+    report = agent_monitor.load_report(session_id) if session_id and run is None else None
+    return {'default_model': config.llm['default'].model,
+            'models': details['models'], 'loaded': details['loaded'],
+            'loaded_details': details.get('loaded_details', []),
+            'loaded_error': details.get('loaded_error'),
+            'observed_at': details.get('observed_at'),
+            'error': details.get('error'),
+            'run': run or (report.get('metrics') if report else None),
+            'progress': (report.get('progress') if report else ThinkingTracker.get_progress(session_id)) if session_id else None,
+            'history': agent_monitor.history()}
+
 @app.post("/api/chat")
 async def create_chat_session(
     session_req: SessionRequest, background_tasks: BackgroundTasks
 ):
+    # The original fork uses shared LLM singletons and process-global cwd.
+    # To make per-task model selection safe, run one task at a time.
+    if any(r.get('status') == 'processing' for r in agent_monitor.RUNS.values()):
+        raise HTTPException(status_code=409, detail='Finish or stop the active task before starting another')
+    chosen_model = session_req.model or config.llm['default'].model
+    details = await asyncio.to_thread(agent_monitor.ollama_models, config.llm['default'].base_url)
+    # The model discovery above yields to other requests, so recheck before reserving.
+    if any(r.get('status') == 'processing' for r in agent_monitor.RUNS.values()):
+        raise HTTPException(status_code=409, detail='A task is already running')
+    if session_req.model and chosen_model not in details['models'] and chosen_model != config.llm['default'].model:
+        if details.get('error'):
+            raise HTTPException(status_code=503, detail='Cannot verify the selected model because Ollama is unreachable. Try again when it is online.')
+        raise HTTPException(status_code=400, detail='Selected model is not in Ollama /api/tags')
+    workspace_dir = None
+    if session_req.project_path and session_req.workspace:
+        raise HTTPException(status_code=400, detail='Choose a workspace or a project folder, not both')
+    if session_req.project_path:
+        requested = Path(session_req.project_path).expanduser()
+        if not requested.is_absolute():
+            raise HTTPException(status_code=400, detail='Project folder must be an absolute path')
+        workspace_dir = requested.resolve()
+        if not workspace_dir.is_dir():
+            raise HTTPException(status_code=400, detail='Project folder does not exist')
+    if session_req.workspace:
+        name = session_req.workspace
+        if not re.fullmatch(r'job_[A-Za-z0-9_-]+', name):
+            raise HTTPException(status_code=400, detail='Invalid workspace name')
+        workspace_dir = (WORKSPACE_ROOT / name).resolve()
+        if workspace_dir.parent != WORKSPACE_ROOT.resolve() or not workspace_dir.is_dir():
+            raise HTTPException(status_code=400, detail='Workspace does not exist')
+    if session_req.previous_session_id and workspace_dir is None:
+        raise HTTPException(status_code=400, detail='Choose the previous task workspace to continue it')
+    exchanges = previous_exchanges(session_req.previous_session_id, workspace_dir) if session_req.previous_session_id else []
     session_id = str(uuid.uuid4())
     active_sessions[session_id] = {
         "status": "processing",
+        "prompt": session_req.prompt,
         "result": None,
         "log": [],
         "workspace": None,
+        "model": chosen_model,
+        "runtime_environment": runtime_environment(),
+        "previous_session_id": session_req.previous_session_id,
+        "context_exchanges": exchanges,
     }
 
     # 创建取消事件
     cancel_events[session_id] = asyncio.Event()
 
     # 创建工作区目录
-    workspace_dir = create_workspace(session_id)
-    active_sessions[session_id]["workspace"] = str(
-        workspace_dir.relative_to(WORKSPACE_ROOT)
-    )
+    workspace_dir = workspace_dir or create_workspace(session_id)
+    active_sessions[session_id]['workspace'] = (str(workspace_dir) if session_req.project_path
+        else str(workspace_dir.relative_to(WORKSPACE_ROOT)))
+    active_sessions[session_id]['project_path'] = str(workspace_dir) if session_req.project_path else None
 
+    agent_monitor.begin_task(session_id, chosen_model)
+    try:
+        agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
+    except Exception as exc:
+        print(f'Could not save initial diagnostic checkpoint: {exc}')
     background_tasks.add_task(process_prompt, session_id, session_req.prompt)
     return {
         "session_id": session_id,
         "workspace": active_sessions[session_id]["workspace"],
+        "project_path": active_sessions[session_id]['project_path'],
+        "context_count": len(exchanges),
     }
+
+
+@app.get('/api/workspaces')
+async def list_workspaces():
+    root = WORKSPACE_ROOT.resolve()
+    return {'workspaces': sorted(p.name for p in WORKSPACE_ROOT.glob('job_*')
+            if p.is_dir() and p.resolve().parent == root)}
+
+
+@app.get('/api/chat/{session_id}/project-files')
+async def project_files(session_id: str, path: str = ''):
+    session = active_sessions.get(session_id) or agent_monitor.load_report(session_id)
+    if not session or not session.get('project_path'):
+        raise HTTPException(status_code=404, detail='Project not found')
+    root = Path(session['project_path']).resolve()
+    target = (root / path).resolve()
+    if not target.is_relative_to(root):
+        raise HTTPException(status_code=403, detail='Access denied')
+    if not target.exists():
+        raise HTTPException(status_code=404, detail='File not found')
+    if target.is_dir():
+        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        return {'path': path, 'entries': [{'name': p.name, 'directory': p.is_dir(),
+                'path': str(p.relative_to(root))} for p in entries[:500]
+                if p.resolve().is_relative_to(root)], 'truncated': len(entries) > 500}
+    if not target.is_file() or target.stat().st_size > 1024 * 1024:
+        raise HTTPException(status_code=400, detail='Only text files up to 1 MB can be viewed')
+    try:
+        return {'name': target.name, 'path': path, 'type': target.suffix.lstrip('.') or 'text',
+                'content': target.read_text(encoding='utf-8')}
+    except (UnicodeError, OSError):
+        raise HTTPException(status_code=400, detail='File cannot be read as UTF-8 text')
 
 
 @app.get("/api/chat/{session_id}")
@@ -155,18 +316,70 @@ async def get_chat_result(session_id: str):
     return session
 
 
+@app.get("/api/chat/{session_id}/diagnostics")
+async def get_chat_diagnostics(session_id: str, refresh_model: bool = False):
+    """Return a bounded, task-specific report suitable for copying to an agent."""
+    session = active_sessions.get(session_id)
+    if session is None:
+        report = agent_monitor.load_report(session_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return report
+    if refresh_model:
+        await asyncio.to_thread(agent_monitor.ollama_models, config.llm['default'].base_url, True)
+    def bounded(value, limit=2500):
+        if isinstance(value, str):
+            return value if len(value) <= limit else value[:limit] + f'\n[truncated: {len(value) - limit} characters omitted]'
+        if isinstance(value, dict):
+            return {key: bounded(item, limit) for key, item in value.items()}
+        if isinstance(value, list):
+            return [bounded(item, limit) for item in value]
+        return value
+
+    logs = get_logs(session_id)
+    important = [entry for entry in logs if entry.get('level', '').upper() in ('WARNING', 'ERROR', 'CRITICAL')]
+    return {
+        "session_id": session_id,
+        "prompt": bounded(session.get("prompt"), 8000),
+        "status": session["status"],
+        "result": session.get("result"),
+        "workspace": session.get("workspace"),
+        "project_path": session.get("project_path"),
+        "runtime_environment": session.get('runtime_environment'),
+        "model_load": agent_monitor.cached_model_status(session.get('model'), config.llm['default'].base_url),
+        "previous_session_id": session.get('previous_session_id'),
+        "context_exchanges": session.get('context_exchanges', []),
+        "metrics": agent_monitor.snapshot(session_id),
+        "progress": ThinkingTracker.get_progress(session_id),
+        "recent_steps": bounded(ThinkingTracker.get_thinking_steps(session_id)[-30:]),
+        "recent_session_logs": bounded(logs[-30:]),
+        "important_logs": bounded(important[-10:]),
+        "note": "Recent events are limited to 30 per source, plus up to 10 warnings and errors; long event fields are truncated. Review for sensitive information before sharing.",
+    }
+
+
+@app.get('/api/reports')
+async def list_diagnostic_reports(limit: int = Query(50, ge=1, le=100),
+                                  before_time: float | None = Query(None, ge=0),
+                                  before_id: str | None = Query(None, max_length=128),
+                                  q: str = Query('', max_length=120)):
+    if (before_time is None) != (before_id is None):
+        raise HTTPException(status_code=400, detail='Both cursor fields are required')
+    return agent_monitor.recent_reports(limit, before_time, before_id, q)
+
+
 @app.post("/api/chat/{session_id}/stop")
 async def stop_processing(session_id: str):
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    if active_sessions[session_id]['status'] != 'processing':
+        return {'status': active_sessions[session_id]['status']}
     if session_id in cancel_events:
         cancel_events[session_id].set()
-
-    active_sessions[session_id]["status"] = "stopped"
-    active_sessions[session_id]["result"] = "处理已被用户停止"
-
-    return {"status": "stopped"}
+    active_sessions[session_id]['stop_requested'] = True
+    ThinkingTracker.add_thinking_step(session_id, 'Stop requested; canceling model requests and waiting for any running tool')
+    return {'status': 'stopping'}
 
 
 @app.websocket("/ws/{session_id}")
@@ -190,23 +403,24 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
         ThinkingTracker.register_ws_send_callback(session_id, ws_send)
 
+        initial_steps = ThinkingTracker.get_thinking_steps(session_id)
+        initial_logs = get_logs(session_id)
+        initial_session_logs = session['log'][:]
         # 初始状态通知中添加日志信息
         await websocket.send_text(
             json.dumps(
                 {
                     "status": session["status"],
-                    "log": session["log"],
-                    "thinking_steps": ThinkingTracker.get_thinking_steps(session_id),
-                    "logs": ThinkingTracker.get_logs(session_id),  # 添加日志信息
+                    "result": session["result"],
+                    "log": initial_session_logs,
+                    "thinking_steps": initial_steps,
+                    "logs": initial_logs,
                 }
             )
         )
 
         # 获取工作区名称(job_id) - 优先从环境变量获取
-        job_id = None
-        # 首先检查当前会话的工作空间关联
-        if "workspace" in session:
-            job_id = session["workspace"]
+        job_id = f'job_{session_id[:8]}'
 
         # 如果当前没有日志监控器，则创建一个
         if session_id not in active_log_monitors and job_id:
@@ -222,9 +436,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             last_log_entries = active_log_monitors[session_id].get_log_entries()
 
         # 等待结果更新
-        last_log_count = 0
-        last_thinking_step_count = 0
-        last_tracker_log_count = 0  # 添加ThinkingTracker日志计数
+        last_log_count = len(initial_session_logs)
+        last_thinking_step_count = len(initial_steps)
+        last_tracker_log_count = len(initial_logs)
+        result_sent = session['status'] != 'processing'
 
         while session["status"] == "processing":
             await asyncio.sleep(0.2)  # 降低检查间隔提高实时性
@@ -274,7 +489,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 last_thinking_step_count = current_thinking_step_count
 
             # 检查ThinkingTracker日志更新
-            tracker_logs = ThinkingTracker.get_logs(session_id)
+            tracker_logs = get_logs(session_id)
             current_tracker_log_count = len(tracker_logs)
             if current_tracker_log_count > last_tracker_log_count:
                 await websocket.send_text(
@@ -299,16 +514,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 session_id, last_thinking_step_count
                             ),
                             "system_logs": last_log_entries,  # 添加系统日志
-                            "logs": ThinkingTracker.get_logs(
-                                session_id, last_tracker_log_count
-                            ),  # 添加ThinkingTracker日志
+                            "logs": get_logs(session_id)[last_tracker_log_count:],
                         }
                     )
                 )
+                result_sent = True
                 break  # 结果已发送，退出循环，避免重复发送
 
         # 仅在循环没有因result而break时才发送最终结果
-        if not session["result"]:
+        if not result_sent:
             await websocket.send_text(
                 json.dumps(
                     {
@@ -319,9 +533,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                             session_id, last_thinking_step_count
                         ),
                         "system_logs": last_log_entries,  # 添加系统日志
-                        "logs": ThinkingTracker.get_logs(
-                            session_id, last_tracker_log_count
-                        ),  # 添加ThinkingTracker日志
+                        "logs": get_logs(session_id)[last_tracker_log_count:],
                     }
                 )
             )
@@ -386,7 +598,7 @@ class LLMCommunicationTracker:
             if prompt:
                 ThinkingTracker.add_communication(
                     session_id,
-                    "发送到LLM",
+                    "Sent to LLM",
                     prompt[:500] + ("..." if len(prompt) > 500 else ""),
                 )
 
@@ -404,7 +616,7 @@ class LLMCommunicationTracker:
                 if isinstance(content, str):
                     ThinkingTracker.add_communication(
                         session_id,
-                        "从LLM接收",
+                        "Received from LLM",
                         content[:500] + ("..." if len(content) > 500 else ""),
                     )
 
@@ -546,11 +758,11 @@ async def get_file_content(file_path: str):
     """获取特定文件的内容"""
     # 安全检查，防止目录遍历攻击
     root_dir = Path(__file__).parent.parent.parent
-    full_path = root_dir / file_path
+    full_path = (root_dir / file_path).resolve()
 
     # 确保文件在项目目录内
     try:
-        full_path.relative_to(root_dir)
+        full_path.relative_to(root_dir.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -576,13 +788,57 @@ async def get_file_content(file_path: str):
 
 
 # 修改process_prompt函数，处理工作区
+async def review_task(prompt: str, exchanges=None):
+    """Review scope before choosing execution mode; keep obvious greetings cheap."""
+    if re.fullmatch(r'\s*(hi|hello|hey|thanks|thank you)[!.?\s]*', prompt, re.I):
+        return 'simple', 'Brief greeting; direct execution.'
+    try:
+        response = await asyncio.wait_for(LLM().ask(
+            messages=[Message.user_message(prompt_with_context(prompt, exchanges or []))],
+            system_msgs=[Message.system_message(
+                'Review the user task for execution, without carrying it out. '
+                'Reply with exactly SIMPLE or COMPLEX on the first line, then one short '
+                'sentence describing the scope. SIMPLE means one straightforward action '
+                'or answer needing no multi-step plan; otherwise choose COMPLEX.')],
+            stream=False, temperature=0), timeout=120)
+        first = response.strip().splitlines()[0].strip().upper().strip(' .:')
+        if first in ('SIMPLE', 'COMPLEX'):
+            return first.lower(), response.strip()[:1000]
+    except Exception as exc:
+        return 'complex', f'Review unavailable ({type(exc).__name__}); using planned execution.'
+    return 'complex', 'Review was inconclusive; using planned execution.'
+
+
 async def process_prompt(session_id: str, prompt: str):
+    """Ensure setup failures do not leave a task permanently marked as running."""
+    original_cwd = os.getcwd()
+    try:
+        await _process_prompt(session_id, prompt)
+    except Exception as exc:
+        os.chdir(original_cwd)
+        session = active_sessions[session_id]
+        session['status'] = 'error'
+        session['result'] = f'Task setup or cleanup failed: {exc}'
+        agent_monitor.finish_task(session_id, 'error')
+        try:
+            agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
+        except Exception as report_exc:
+            print(f'Could not save diagnostic report: {report_exc}')
+
+
+async def _process_prompt(session_id: str, prompt: str):
+    monitor_token = agent_monitor.enter_task(session_id, cancel_events.get(session_id))
+    # Apply the selected model BEFORE agent/flow initialization.
+    selected_model = active_sessions[session_id]['model']
+    config.llm['default'].model = selected_model
+    for instance in LLM._instances.values():
+        if instance.base_url == config.llm['default'].base_url:
+            instance.model = selected_model
     # 获取会话工作区
     workspace_dir = None
     if session_id in active_sessions and "workspace" in active_sessions[session_id]:
         workspace_path = active_sessions[session_id]["workspace"]
-        workspace_dir = WORKSPACE_ROOT / workspace_path
-        os.makedirs(workspace_dir, exist_ok=True)
+        workspace_dir = Path(workspace_path) if active_sessions[session_id].get('project_path') else WORKSPACE_ROOT / workspace_path
 
     # 如果没有工作区，创建一个
     if not workspace_dir:
@@ -597,29 +853,32 @@ async def process_prompt(session_id: str, prompt: str):
     os.chdir(workspace_dir)
 
     # 使用工作区名称作为日志文件名前缀
-    job_id = workspace_dir.name
+    job_id = f'job_{session_id[:8]}'
     # 设置日志文件路径
     task_log_path = LOGS_DIR / f"{job_id}.log"
 
     # 创建日志监视器并开始监控
-    log_monitor = LogFileMonitor(job_id)
+    log_monitor = LogFileMonitor(job_id, log_dir=str(LOGS_DIR))
     observer = log_monitor.start_monitoring()
     active_log_monitors[session_id] = log_monitor
 
     async def sync_logs():
         """定期从LogFileMonitor获取日志并实时更新到ThinkingTracker"""
         last_count = 0
+        next_checkpoint = time.monotonic() + 5
         try:
             while True:
                 if session_id not in active_log_monitors:
                     break
-                current_logs = active_log_monitors[session_id].get_log_entries()
+                current_logs = get_logs(session_id)
                 if len(current_logs) > last_count:
                     # 处理新的日志条目
                     new_logs = current_logs[last_count:]
                     # 逐条处理每条新日志，确保实时性
                     for log_entry in new_logs:
                         # 单独处理每条日志，立即添加到ThinkingTracker
+                        if isinstance(log_entry, str):
+                            log_entry = {'message': log_entry}
                         ThinkingTracker.add_log_entry(
                             session_id,
                             {
@@ -629,6 +888,12 @@ async def process_prompt(session_id: str, prompt: str):
                             },
                         )
                     last_count = len(current_logs)
+                if time.monotonic() >= next_checkpoint:
+                    try:
+                        agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
+                    except Exception as exc:
+                        print(f'Could not save diagnostic checkpoint: {exc}')
+                    next_checkpoint = time.monotonic() + 5
                 # 减少轮询间隔，提高实时性
                 await asyncio.sleep(0.1)  # 每0.1秒检查一次
         except Exception as e:
@@ -641,21 +906,23 @@ async def process_prompt(session_id: str, prompt: str):
     os.environ["OPENMANUS_LOG_FILE"] = str(task_log_path)
     os.environ["OPENMANUS_TASK_ID"] = job_id
 
+    task_log_sink = None
     try:
+        task_log_sink = logger.add(str(task_log_path), rotation="100 MB")
         # 使用日志捕获上下文管理器解析日志级别和内容
         with capture_session_logs(session_id) as log:
             # 初始化思考跟踪
             ThinkingTracker.start_tracking(session_id)
-            ThinkingTracker.add_thinking_step(session_id, "开始处理用户请求")
+            ThinkingTracker.add_thinking_step(session_id, "Starting user request")
             ThinkingTracker.add_thinking_step(
-                session_id, f"工作区目录: {workspace_dir.name}"
+                session_id, f"Workspace: {workspace_dir.name}"
             )
 
             # 直接记录用户输入的prompt
-            ThinkingTracker.add_communication(session_id, "用户输入", prompt)
+            ThinkingTracker.add_communication(session_id, "User input", prompt)
 
             # 初始化代理和任务流程
-            ThinkingTracker.add_thinking_step(session_id, "初始化AI代理和任务流程")
+            ThinkingTracker.add_thinking_step(session_id, "Initializing AI agent and task flow")
             agent = Manus()
 
             # 使用包装器包装LLM
@@ -677,7 +944,7 @@ async def process_prompt(session_id: str, prompt: str):
                     # 记录通信内容
                     print(f"发送到LLM: {prompt_content[:100]}...")
                     ThinkingTracker.add_communication(
-                        session_id, "发送到LLM", prompt_content
+                        session_id, "Sent to LLM", prompt_content
                     )
 
                 def on_after_request(data):
@@ -703,7 +970,7 @@ async def process_prompt(session_id: str, prompt: str):
                     # 记录通信内容
                     print(f"从LLM接收: {response_content[:100]}...")
                     ThinkingTracker.add_communication(
-                        session_id, "从LLM接收", response_content
+                        session_id, "Received from LLM", response_content
                     )
 
                 # 注册回调
@@ -713,24 +980,27 @@ async def process_prompt(session_id: str, prompt: str):
                 # 替换原始LLM
                 agent.llm = wrapped_llm
 
-            flow = FlowFactory.create_flow(
-                flow_type=FlowType.PLANNING,
-                agents=agent,
-            )
+            ThinkingTracker.add_thinking_step(session_id, "Reviewing task scope")
+            exchanges = active_sessions[session_id].get('context_exchanges', [])
+            complexity, review = await review_task(prompt, exchanges)
+            agent_monitor.set_review(session_id, complexity, review, prompt)
+            ThinkingTracker.add_thinking_step(session_id, f"Task review ({complexity}): {review}")
+            if exchanges:
+                ThinkingTracker.add_thinking_step(session_id, f"Including excerpts from {len(exchanges)} previous task(s) in this workspace")
 
             # 记录处理开始
             ThinkingTracker.add_thinking_step(
-                session_id, f"分析用户请求: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+                session_id, f"Analyzing user request: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
             )
-            log.info(f"开始执行: {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
+            log.info(f"Starting task: {prompt[:50]}{'...' if len(prompt) > 50 else ''}")
 
             # 检查任务是否被取消
             cancel_event = cancel_events.get(session_id)
             if cancel_event and cancel_event.is_set():
-                log.warning("处理已被用户取消")
+                log.warning("Processing canceled by user")
                 ThinkingTracker.mark_stopped(session_id)
                 active_sessions[session_id]["status"] = "stopped"
-                active_sessions[session_id]["result"] = "处理已被用户停止"
+                active_sessions[session_id]["result"] = "Processing stopped by user"
                 return
 
             # 执行前检查工作区已有文件
@@ -739,22 +1009,34 @@ async def process_prompt(session_id: str, prompt: str):
                 existing_files.update(f.name for f in workspace_dir.glob(ext))
 
             # 跟踪计划创建过程
-            ThinkingTracker.add_thinking_step(session_id, "创建任务执行计划")
-            ThinkingTracker.add_thinking_step(session_id, "开始执行任务计划")
+            if complexity == 'complex':
+                ThinkingTracker.add_thinking_step(session_id, "Creating task execution plan")
 
             # 获取取消事件以传递给flow.execute
             cancel_event = cancel_events.get(session_id)
 
             # 初始检查，如果已经取消则不执行
             if cancel_event and cancel_event.is_set():
-                log.warning("处理已被用户取消")
+                log.warning("Processing canceled by user")
                 ThinkingTracker.mark_stopped(session_id)
                 active_sessions[session_id]["status"] = "stopped"
-                active_sessions[session_id]["result"] = "处理已被用户停止"
+                active_sessions[session_id]["result"] = "Processing stopped by user"
                 return
 
             # 执行实际处理 - 传递job_id和cancel_event给flow.execute方法
-            result = await flow.execute(prompt, job_id, cancel_event)
+            if complexity == 'simple':
+                ThinkingTracker.add_thinking_step(session_id, "Executing directly")
+                agent.finish_on_text = True
+                result = await agent.run(prompt_with_context(prompt, exchanges), cancel_event=cancel_event)
+            else:
+                flow = FlowFactory.create_flow(flow_type=FlowType.PLANNING, agents=agent)
+                result = await flow.execute(prompt_with_context(prompt, exchanges), job_id, cancel_event)
+
+            if cancel_event and cancel_event.is_set():
+                ThinkingTracker.mark_stopped(session_id)
+                active_sessions[session_id]['status'] = 'stopped'
+                active_sessions[session_id]['result'] = 'Processing stopped by user'
+                return
 
             # 执行结束后检查新生成的文件
             new_files = set()
@@ -766,15 +1048,15 @@ async def process_prompt(session_id: str, prompt: str):
                 files_list = ", ".join(newly_created)
                 ThinkingTracker.add_thinking_step(
                     session_id,
-                    f"在工作区 {workspace_dir.name} 中生成了{len(newly_created)}个文件: {files_list}",
+                    f"Generated {len(newly_created)} files in workspace {workspace_dir.name}: {files_list}",
                 )
                 # 将文件列表也添加到会话结果中
                 active_sessions[session_id]["generated_files"] = list(newly_created)
 
             # 记录完成情况
-            log.info("处理完成")
+            log.info("Processing completed")
             ThinkingTracker.add_conclusion(
-                session_id, f"任务处理完成！已在工作区 {workspace_dir.name} 中生成结果。"
+                session_id, f"Task completed! Results saved to workspace {workspace_dir.name}."
             )
 
             active_sessions[session_id]["status"] = "completed"
@@ -788,15 +1070,23 @@ async def process_prompt(session_id: str, prompt: str):
         print("处理已取消")
         ThinkingTracker.mark_stopped(session_id)
         active_sessions[session_id]["status"] = "stopped"
-        active_sessions[session_id]["result"] = "处理已被取消"
+        active_sessions[session_id]["result"] = "Processing canceled"
     except Exception as e:
         # 处理错误情况
-        error_msg = f"处理出错: {str(e)}"
+        error_msg = f"Processing error: {str(e)}"
         print(error_msg)
-        ThinkingTracker.add_error(session_id, f"处理遇到错误: {str(e)}")
+        ThinkingTracker.add_error(session_id, f"Processing encountered an error: {str(e)}")
         active_sessions[session_id]["status"] = "error"
-        active_sessions[session_id]["result"] = f"发生错误: {str(e)}"
+        active_sessions[session_id]["result"] = f"Error: {str(e)}"
     finally:
+        if task_log_sink is not None:
+            logger.remove(task_log_sink)
+        agent_monitor.finish_task(session_id, active_sessions.get(session_id, {}).get('status', 'error'))
+        try:
+            agent_monitor.save_report(session_id, await get_chat_diagnostics(session_id))
+        except Exception as exc:
+            print(f'Could not save diagnostic report: {exc}')
+        agent_monitor.leave_task(monitor_token)
         # 恢复原始工作目录
         os.chdir(original_cwd)
 
@@ -868,10 +1158,7 @@ async def get_system_logs(session_id: str):
     if session_id not in active_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    job_id = None
-    if "workspace" in active_sessions[session_id]:
-        workspace_path = active_sessions[session_id]["workspace"]
-        job_id = workspace_path
+    job_id = f'job_{session_id[:8]}'
 
     if not job_id:
         return {"logs": []}

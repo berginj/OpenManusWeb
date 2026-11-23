@@ -4,6 +4,7 @@ model = "claude-3-5-sonnet"
 base_url = "https://api.openai.com/v1"
 api_key = "sk-..."
 max_tokens = 4096
+request_timeout_seconds = 600 # Increase for slow local models if needed.
 temperature = 0.0
 
 # [llm] #AZURE OPENAI:

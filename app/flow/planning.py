@@ -12,6 +12,8 @@ from app.llm import LLM
 from app.logger import logger
 from app.schema import AgentState, Message
 from app.tool import PlanningTool
+from app.web.agent_monitor import TASK_ID
+from app.web.thinking_tracker import ThinkingTracker
 
 
 class PlanningFlow(BaseFlow):
@@ -80,7 +82,7 @@ class PlanningFlow(BaseFlow):
                     logger.error(
                         f"Plan creation failed. Plan ID {self.active_plan_id} not found in planning tool."
                     )
-                    return f"Failed to create plan for: {input_text}"
+                    raise RuntimeError("Failed to create the task plan")
 
             result = ""
             while True:
@@ -100,7 +102,17 @@ class PlanningFlow(BaseFlow):
                 # Execute current step with appropriate agent
                 step_type = step_info.get("type") if step_info else None
                 executor = self.get_executor(step_type)
-                step_result = await self._execute_step(executor, step_info)
+                sid = TASK_ID.get()
+                plan = self.planning_tool.plans[self.active_plan_id]
+                if sid:
+                    text = f"Plan step {self.current_step_index + 1}/{len(plan['steps'])}: {step_info['text']}"
+                    ThinkingTracker.add_thinking_step(sid, text)
+                    ThinkingTracker.update_progress(sid, total_steps=len(plan['steps']),
+                        completed_steps=self.current_step_index, current_step=text)
+                step_result = await self._execute_step(executor, step_info, cancel_event)
+                if sid and not (cancel_event and cancel_event.is_set()):
+                    ThinkingTracker.update_progress(sid, total_steps=len(plan['steps']),
+                        completed_steps=self.current_step_index + 1)
                 result += step_result + "\n"
 
                 # Check if agent wants to terminate
@@ -110,7 +122,7 @@ class PlanningFlow(BaseFlow):
             return result
         except Exception as e:
             logger.error(f"Error in PlanningFlow: {str(e)}")
-            return f"Execution failed: {str(e)}"
+            raise
 
     async def _create_initial_plan(self, request: str, job_id: str = None) -> None:
         """Create an initial plan based on the request using the flow's LLM and PlanningTool."""
@@ -119,13 +131,6 @@ class PlanningFlow(BaseFlow):
             job_id = f"job_{request[:8].replace(' ', '_')}"
             if len(job_id) < 10:  # 如果太短，加上时间戳
                 job_id = f"job_{int(time.time())}"
-
-        log_file_path = f"logs/{job_id}.log"
-        os.environ["OPENMANUS_TASK_ID"] = job_id
-        os.environ["OPENMANUS_LOG_FILE"] = log_file_path
-
-        # 设置日志文件名为job_id
-        logger.add(log_file_path, rotation="100 MB")
 
         logger.info(f"Creating initial plan with ID: {self.active_plan_id}")
 
@@ -249,7 +254,7 @@ class PlanningFlow(BaseFlow):
             logger.warning(f"Error finding current step index: {e}")
             return None, None
 
-    async def _execute_step(self, executor: BaseAgent, step_info: dict) -> str:
+    async def _execute_step(self, executor: BaseAgent, step_info: dict, cancel_event=None) -> str:
         """Execute the current step with the specified agent using agent.run()."""
         # Prepare context for the agent with current plan status
         plan_status = await self._get_plan_text()
@@ -268,7 +273,14 @@ class PlanningFlow(BaseFlow):
 
         # Use agent.run() to execute the step
         try:
-            step_result = await executor.run(step_prompt)
+            # Each plan step has its own budget and a text response finishes that step.
+            executor.current_step = 0
+            if hasattr(executor, 'finish_on_text'):
+                executor.finish_on_text = True
+            step_result = await executor.run(step_prompt, cancel_event=cancel_event)
+
+            if cancel_event and cancel_event.is_set():
+                return step_result
 
             # Mark the step as completed after successful execution
             await self._mark_step_completed()
@@ -276,7 +288,7 @@ class PlanningFlow(BaseFlow):
             return step_result
         except Exception as e:
             logger.error(f"Error executing step {self.current_step_index}: {e}")
-            return f"Error executing step {self.current_step_index}: {str(e)}"
+            raise
 
     async def _mark_step_completed(self) -> None:
         """Mark the current step as completed."""

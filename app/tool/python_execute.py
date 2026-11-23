@@ -1,11 +1,13 @@
-import threading
+import asyncio
+import os
+import sys
 from typing import Dict
 
 from app.tool.base import BaseTool
 
 
 class PythonExecute(BaseTool):
-    """A tool for executing Python code with timeout and safety restrictions."""
+    """Execute Python in a separate process with a timeout."""
 
     name: str = "python_execute"
     description: str = "Executes Python code string. Note: Only print outputs are visible, function return values are not captured. Use print statements to see results."
@@ -35,36 +37,28 @@ class PythonExecute(BaseTool):
         Returns:
             Dict: Contains 'output' with execution output or error message and 'success' status.
         """
-        result = {"observation": ""}
-
-        def run_code():
-            try:
-                safe_globals = {"__builtins__": dict(__builtins__)}
-
-                import sys
-                from io import StringIO
-
-                output_buffer = StringIO()
-                sys.stdout = output_buffer
-
-                exec(code, safe_globals, {})
-
-                sys.stdout = sys.__stdout__
-
-                result["observation"] = output_buffer.getvalue()
-
-            except Exception as e:
-                result["observation"] = str(e)
-                result["success"] = False
-
-        thread = threading.Thread(target=run_code)
-        thread.start()
-        thread.join(timeout)
-
-        if thread.is_alive():
-            return {
-                "observation": f"Execution timeout after {timeout} seconds",
-                "success": False,
-            }
-
-        return result
+        env = os.environ.copy()
+        env['PYTHONIOENCODING'] = 'utf-8'
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-c',
+            "import sys; exec(compile(sys.stdin.read(), '<python_execute>', 'exec'))",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(code.encode('utf-8')), timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return {"observation": f"Execution timeout after {timeout} seconds", "success": False}
+        output = stdout.decode('utf-8', errors='replace').replace('\r\n', '\n')
+        errors = stderr.decode('utf-8', errors='replace').replace('\r\n', '\n')
+        if process.returncode:
+            return {"observation": output + errors, "success": False}
+        return {"observation": output + errors}

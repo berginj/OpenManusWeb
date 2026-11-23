@@ -33,7 +33,7 @@ export class WorkspaceManager {
         if (this.workspaces.length === 0) {
             const emptyDiv = document.createElement('div');
             emptyDiv.className = 'empty-workspace';
-            emptyDiv.textContent = '没有工作区文件';
+            emptyDiv.textContent = 'No workspace files';
             this.workspaceContainer.appendChild(emptyDiv);
             return;
         }
@@ -184,21 +184,21 @@ export class WorkspaceManager {
 
         // 重置倒计时值
         this.countdownValue = 5;
-        this.refreshCountdownElement.textContent = `${this.countdownValue}秒后刷新`;
+        this.refreshCountdownElement.textContent = `Refresh in ${this.countdownValue}s`;
 
         // 设置新计时器，每1秒更新一次
         this.refreshTimer = setInterval(() => {
             this.countdownValue--;
 
             if (this.countdownValue > 0) {
-                this.refreshCountdownElement.textContent = `${this.countdownValue}秒后刷新`;
+                this.refreshCountdownElement.textContent = `Refresh in ${this.countdownValue}s`;
             } else {
-                this.refreshCountdownElement.textContent = '刷新中...';
+                this.refreshCountdownElement.textContent = 'Refreshing...';
                 // 触发刷新
                 this.refreshWorkspaces();
                 // 重置倒计时
                 this.countdownValue = 5;
-                this.refreshCountdownElement.textContent = `${this.countdownValue}秒后刷新`;
+                this.refreshCountdownElement.textContent = `Refresh in ${this.countdownValue}s`;
             }
         }, 1000);
     }
@@ -208,16 +208,16 @@ export class WorkspaceManager {
         try {
             const response = await fetch('/api/files');
             if (!response.ok) {
-                throw new Error(`API错误: ${response.status}`);
+                throw new Error(`API Error: ${response.status}`);
             }
 
             const data = await response.json();
             this.updateWorkspaces(data.workspaces);
 
-            console.log('刷新文件列表');
+            console.log('Refreshed file list');
 
         } catch (error) {
-            console.error('刷新工作区文件错误:', error);
+            console.error('Error refreshing workspace files:', error);
         }
     }
 }

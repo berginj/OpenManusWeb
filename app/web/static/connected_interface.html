@@ -543,6 +543,38 @@
         </header>
 
         <main>
+        <section id="agent-monitor" class="panel" aria-label="Local inference monitor" style="margin-bottom:20px">
+          <div style="margin-bottom:12px"><button id="diagnostics-button" type="button">Prepare troubleshooting report</button> <span id="diagnostics-status" role="status"></span></div>
+          <div style="margin-bottom:12px"><label for="diagnostics-search">Find saved tasks:</label> <input id="diagnostics-search" type="search" maxlength="120" placeholder="Task, workspace, or ID"> <button id="diagnostics-refresh" type="button">Refresh list</button> <button id="diagnostics-more" type="button" disabled>Load more</button> <span id="reports-info" role="status"></span></div>
+          <div style="margin-bottom:12px"><label for="diagnostics-history">Saved task reports:</label> <select id="diagnostics-history"><option value="">Select a previous task</option></select> <button id="diagnostics-open" type="button">Open report</button> <button id="diagnostics-resume" type="button">Open task in chat</button></div>
+          <div id="diagnostics-panel" hidden style="margin-bottom:12px"><label for="diagnostics-text">Review and edit the report before sharing; it may contain sensitive information.</label><textarea id="diagnostics-text" style="width:100%;height:220px;display:block"></textarea><button id="diagnostics-copy" type="button">Copy report</button> <button id="diagnostics-summary" type="button">Show concise report</button> <button id="diagnostics-full" type="button">Show full data</button></div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+            <div><h2 style="margin-bottom:2px">Local inference monitor</h2><small id="monitor-backend">Checking Ollama...</small></div>
+            <label style="font-size:14px">Model for next task: <select id="monitor-model" style="padding:7px;margin-left:6px;max-width:280px"></select></label>
+            <label style="font-size:14px">Workspace for next task: <select id="task-workspace" style="padding:7px;margin-left:6px;max-width:220px"><option value="">New workspace</option></select></label>
+          </div>
+          <div style="margin-top:8px"><label for="project-path">Or work in a local project folder (absolute path):</label> <input id="project-path" type="text" style="width:min(100%,420px)" placeholder="C:\path\to\project"> <small>Tasks can read and modify files in this folder.</small></div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px">
+            <div style="flex:1;min-width:140px"><small>Active model</small><div id="monitor-active-model" style="font-weight:600">—</div></div>
+            <div style="flex:1;min-width:110px"><small>Model calls (done/total)</small><div id="monitor-calls">—</div></div>
+            <div style="flex:1;min-width:145px"><small>Completed output tokens</small><div id="monitor-output">—</div></div>
+            <div style="flex:1;min-width:130px"><small>Reported input tokens</small><div id="monitor-input">—</div></div>
+            <div style="flex:1;min-width:100px"><small>Task elapsed</small><div id="monitor-elapsed">—</div></div>
+          </div>
+          <div style="margin-top:10px;padding:10px;background:#f2f6f9;border-radius:6px">
+            <strong id="monitor-state">Idle</strong><div id="monitor-detail" style="font-size:13px">—</div>
+            <div id="monitor-placement" style="font-size:13px;margin-top:6px"></div>
+            <div id="monitor-progress" style="font-size:13px;margin-top:6px"></div>
+            <div id="monitor-estimate" style="font-size:13px;margin-top:6px">Task review and estimate will appear here.</div>
+          </div>
+          <details style="margin-top:12px"><summary style="cursor:pointer">Compare model/task history</summary>
+            <div style="overflow-x:auto"><table style="width:100%;margin-top:8px;text-align:left;font-size:12px;border-spacing:8px 5px">
+              <thead><tr><th>Model</th><th>Tasks</th><th>Completed</th><th>Avg task</th><th>Input reported</th><th>Output reported + estimated</th><th>Effective tok/s*</th><th>Trend</th><th>Forecast checks</th></tr></thead>
+              <tbody id="monitor-history"><tr><td colspan="9">No runs yet</td></tr></tbody>
+            </table></div>
+            <small>History covers the latest 60 tasks. Forecast checks show how many completed tasks finished within their original predicted range; small samples are not a reliability guarantee. Token totals may be incomplete. *Reported output tokens divided by wall time for calls reporting output usage, including prompt/network latency. Trend compares throughput across 3+3 completed measured tasks; test identical prompts/settings for meaningful comparisons.</small>
+          </details>
+        </section>
             <div class="panel-container">
                 <!-- 左侧面板 - 处理进度 -->
                 <div class="panel left-panel">
@@ -577,6 +609,7 @@
                         <div id="workspace-files" class="workspace-files">
                             <!-- 工作区文件列表将由JavaScript动态生成 -->
                         </div>
+                        <div id="project-browser" hidden><h4>Current project files</h4><div id="project-location"></div><div id="project-files" class="workspace-files"></div></div>
                     </div>
                 </div>
 
@@ -590,6 +623,7 @@
 
                     <div class="input-area">
                         <textarea id="user-input" placeholder="输入您的问题或指令..." data-i18n="input_placeholder"></textarea>
+                        <label><input id="include-context" type="checkbox" checked> Include up to 3 previous task exchanges in the same workspace</label>
                         <div class="button-group">
                             <button id="send-btn" class="btn-send" data-i18n="send">发送</button>
                             <button id="stop-btn" class="btn-stop" disabled data-i18n="stop">停止</button>
@@ -618,5 +652,6 @@
 
     <!-- 引入JavaScript模块 -->
     <script type="module" src="/static/connected_interface.js"></script>
+    <script src="/static/agent_monitor.js"></script>
 </body>
 </html>

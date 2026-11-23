@@ -130,10 +130,6 @@ Then input your idea via terminal!
 You can also use OpenManus through a user-friendly web interface:
 
 ```bash
-uvicorn app.web.app:app --reload
-```
-or
-```bash
 python web_run.py
 ```
 
@@ -143,6 +139,58 @@ Then open your browser and navigate to `http://localhost:8000` to access the web
 - Monitor AI thinking process in real-time
 - View and access workspace files
 - See execution progress visually
+
+Choose an installed model and either a new workspace, an existing OpenManus
+workspace, or an absolute path to an existing local project folder before
+sending a task. The agent can read and change files in the selected project;
+the project browser shows its files. The launcher listens on localhost and does
+not automatically restart when files change, so an edit cannot interrupt a run.
+The model list updates when Ollama reconnects or installed models change; if a
+selected model disappears, choose another before starting a task.
+Follow-up tasks in the same workspace include excerpts from up to three prior
+linked task requests and results by default. Uncheck **Include up to 3 previous
+task exchanges** to start without that context. The included excerpts appear
+in the troubleshooting report, and long excerpts are truncated.
+
+The monitor shows model calls, reported input and output tokens, estimated
+streamed output where exact counts are unavailable, elapsed time, and plan
+progress. When Ollama reports it, the monitor also shows the selected model's
+loaded memory, VRAM, context length, and quantization, with the observation time.
+The handoff includes these details and runtime settings; endpoint credentials,
+path, and query are excluded. Once at least three completed tasks with the same model, reviewed
+complexity and broad task category are available, it shows a historical duration
+range. If that category has fewer than three examples, five tasks with the same
+model and complexity enable a broader estimate. Forecast checks compare prior
+predicted ranges with actual completed durations. These are rough comparisons,
+not deadlines. Stop requests cancel the client's in-flight model request and
+wait for any running tool to return; the model server controls when inference
+actually stops.
+When there are too few comparable tasks, the monitor may show the observed
+range of at least two completed runs of the same model as a historical reference.
+Those tasks can differ substantially and are not treated as a forecast.
+The Python execution tool runs in a separate process so its output does not
+redirect the web server's stdout. Its timeout terminates the direct Python
+process; subprocesses created by task code may need separate cleanup.
+
+Token totals include only usage reported by the provider plus separately labeled
+character-based output estimates. The displayed call coverage shows when usage
+is missing; failed or in-flight calls may also consume unreported tokens. Tool
+requests default to a 600-second timeout to accommodate slow local inference.
+Set `request_timeout_seconds` in the `[llm]` section of `config/config.toml`
+to change it. The preliminary review has its own 120-second limit.
+
+Use **Prepare troubleshooting report** to review, edit, and copy a concise
+handoff with the task, progress, usage, result, and recent warnings or errors.
+The handoff also includes excerpts of recent tool inputs and outputs; those can
+contain project data, so edit them before copying if needed.
+**Show full data** includes additional recent events and metrics. Completed reports are saved locally and can be
+reopened from the report menu. **Open task in chat** restores its workspace,
+saved usage, and available conversation excerpts for a follow-up. Review the contents for private information
+before sharing them. Active tasks are checkpointed approximately every five
+seconds; after an unexpected restart, the last checkpoint is marked interrupted
+and the task is not resumed. Reports and task history are stored under `logs/`.
+Use the saved-task search to find a request, workspace, or task ID; **Load more**
+accesses older results.
 
 For unstable version, you also can run:
 

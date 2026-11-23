@@ -25,3 +25,7 @@ Choose the most efficient path forward:
 
 Be concise in your reasoning, then select the appropriate tool or action.
 """
+
+# User preference: English-language planning.
+PLANNING_SYSTEM_PROMPT += "\nAll plan titles, steps, status updates, and final summaries must be in English."
+NEXT_STEP_PROMPT += "\nRespond in English."

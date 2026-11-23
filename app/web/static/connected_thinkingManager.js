@@ -75,7 +75,13 @@ export class ThinkingManager {
         if (step.type === 'communication') {
             const headerDiv = document.createElement('div');
             headerDiv.className = 'communication-header';
-            headerDiv.innerHTML = `<span class="communication-direction">${step.message}</span> <span class="toggle-icon">▶</span>`;
+            const direction = document.createElement('span');
+            direction.className = 'communication-direction';
+            direction.textContent = step.message;
+            const icon = document.createElement('span');
+            icon.className = 'toggle-icon';
+            icon.textContent = '▶';
+            headerDiv.append(direction, ' ', icon);
             headerDiv.onclick = function() {
                 const detailsElement = this.nextElementSibling;
                 const toggleIcon = this.querySelector('.toggle-icon');
@@ -96,7 +102,7 @@ export class ThinkingManager {
             if (step.details) {
                 detailsElement.textContent = step.details;
             } else {
-                detailsElement.textContent = '(无详细内容)';
+                detailsElement.textContent = '(No details)';
             }
 
             contentDiv.appendChild(headerDiv);
@@ -107,7 +113,7 @@ export class ThinkingManager {
             // 创建详情按钮
             const detailsButton = document.createElement('button');
             detailsButton.className = 'btn-details';
-            detailsButton.textContent = '显示详情 ▼';
+            detailsButton.textContent = 'Show details ▼';
             contentDiv.appendChild(detailsButton);
 
             // 创建详情内容（初始隐藏）
@@ -121,10 +127,10 @@ export class ThinkingManager {
             detailsButton.addEventListener('click', () => {
                 if (detailsDiv.style.display === 'none') {
                     detailsDiv.style.display = 'block';
-                    detailsButton.textContent = '隐藏详情 ▲';
+                    detailsButton.textContent = 'Hide details ▲';
                 } else {
                     detailsDiv.style.display = 'none';
-                    detailsButton.textContent = '显示详情 ▼';
+                    detailsButton.textContent = 'Show details ▼';
                 }
             });
         }
@@ -149,33 +155,33 @@ export class ThinkingManager {
 
         switch (step.type) {
             case 'thinking':
-                return step.content || '思考过程';
+                return step.content || 'Thinking process';
             case 'tool':
-                return `使用工具: ${step.tool || ''}`;
+                return `Using tool: ${step.tool || ''}`;
             case 'file':
-                return `在工作区 ${step.workspace || ''} 中生成了 ${step.files ? step.files.length : 0} 个文件:`;
+                return `Generated ${step.files ? step.files.length : 0} files in workspace ${step.workspace || ''}:`;
             case 'conclusion':
             case 'completed':
-                return `任务处理完成! 已在工作区 ${step.workspace || ''} 中生成结果。`;
+                return `Task completed! Results saved to workspace ${step.workspace || ''}.`;
             case 'error':
-                return `发生错误: ${step.error || ''}`;
+                return `Error: ${step.error || ''}`;
             case 'system':
-                return step.content || '系统消息';
+                return step.content || 'System message';
             case 'system_log':
-                return step.message || '系统日志';
+                return step.message || 'System log';
             case 'progress':
-                return `执行步骤 ${step.current}/${step.total}`;
+                return `Executing step ${step.current}/${step.total}`;
             case 'communication':
-                return step.message || '通信';
+                return step.message || 'Communication';
             default:
-                return step.content ? step.content.substring(0, 50) + (step.content.length > 50 ? '...' : '') : '思考步骤';
+                return step.content ? step.content.substring(0, 50) + (step.content.length > 50 ? '...' : '') : 'Thinking step';
         }
     }
 
     // 更新记录计数
     updateRecordCount() {
         if (this.recordCountElement) {
-            this.recordCountElement.textContent = `${this.thinkingSteps.length} 条记录`;
+            this.recordCountElement.textContent = `${this.thinkingSteps.length} records`;
         }
     }
 

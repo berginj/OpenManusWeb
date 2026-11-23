@@ -12,6 +12,7 @@ import { initLanguage, setLanguage, updatePageTexts, t } from '/static/i18n.js';
 class App {
     constructor() {
         this.sessionId = null;
+        this.sessionWorkspace = null;
         this.isProcessing = false;
 
         // 初始化各个管理器
@@ -42,10 +43,96 @@ class App {
 
         // 加载工作区文件
         this.loadWorkspaceFiles();
+        this.restoreSession().then(restored => { if (!restored) this.loadWorkspaceChoices(); });
+    }
+
+    async loadWorkspaceChoices(selected = null) {
+        try {
+            const response = await fetch('/api/workspaces', {cache: 'no-store'});
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json(), select = document.getElementById('task-workspace');
+            const choice = selected ?? select.value;
+            select.replaceChildren(new Option('New workspace', ''));
+            for (const name of data.workspaces) select.add(new Option(name, name));
+            select.value = data.workspaces.includes(choice) ? choice : '';
+        } catch (error) { console.error('Could not load workspaces:', error); }
+    }
+
+    async restoreSession(requestedSid = null) {
+        const sid = requestedSid || localStorage.getItem('openmanus-session-id');
+        if (!sid) return false;
+        if (this.isProcessing) return sid === this.sessionId;
+        try {
+            let response = await fetch(`/api/chat/${encodeURIComponent(sid)}`, {cache: 'no-store'});
+            if (response.status === 404) response = await fetch(`/api/chat/${encodeURIComponent(sid)}/diagnostics`, {cache: 'no-store'});
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const session = await response.json();
+            this.websocketManager.close();
+            this.chatManager.clearMessages();
+            this.thinkingManager.clearThinking();
+            this.sessionId = sid;
+            localStorage.setItem('openmanus-session-id', sid);
+            this.sessionWorkspace = {workspace: session.workspace, project_path: session.project_path};
+            if (session.project_path) {
+                document.getElementById('task-workspace').value = '';
+                document.getElementById('project-path').value = session.project_path;
+                this.projectDirectory = '';
+                await this.loadProjectFiles();
+            } else {
+                document.getElementById('project-path').value = '';
+                document.getElementById('project-browser').hidden = true;
+                if (session.workspace) {
+                    await this.loadWorkspaceChoices(session.workspace);
+                    if (!document.getElementById('task-workspace').value) {
+                        this.chatManager.addSystemMessage('The previous workspace is no longer available. Choose a workspace for the next task.');
+                    }
+                }
+            }
+            document.getElementById('include-context').checked = true;
+            if (session.context_exchanges?.length) {
+                this.chatManager.addSystemMessage('Previous task excerpts included in this conversation; long excerpts may be truncated.');
+                for (const exchange of session.context_exchanges) {
+                    if (exchange.request) this.chatManager.addUserMessage(exchange.request);
+                    if (exchange.result) this.chatManager.addAIMessage(exchange.result);
+                }
+            }
+            if (session.prompt) this.chatManager.addUserMessage(session.prompt);
+            if (session.status === 'processing') {
+                this.isProcessing = true;
+                document.getElementById('send-btn').disabled = true;
+                document.getElementById('stop-btn').disabled = !!session.stop_requested;
+                document.getElementById('status-indicator').textContent = session.stop_requested ? 'Stopping…' : t('processing_request');
+                this.websocketManager.connect(sid);
+            } else {
+                this.isProcessing = false;
+                document.getElementById('send-btn').disabled = false;
+                document.getElementById('stop-btn').disabled = true;
+                document.getElementById('status-indicator').textContent = session.status === 'interrupted' ? 'Interrupted; task was not resumed.' : '';
+                if (session.status === 'interrupted') this.chatManager.addSystemMessage('This task was interrupted when the server stopped. The last checkpoint is shown.');
+                if (session.result) this.chatManager.addAIMessage(session.result);
+                const steps = session.thinking_steps || session.recent_steps;
+                if (steps) this.thinkingManager.addThinkingSteps(steps);
+                const logs = session.log || session.recent_session_logs || [];
+                this.thinkingManager.addThinkingSteps(logs.map(entry => ({
+                    message: String(entry.message ?? ''), type: 'system_log',
+                    timestamp: entry.timestamp || Date.now() / 1000
+                })));
+            }
+            return true;
+        } catch (error) {
+            console.error('Could not restore task:', error);
+            return false;
+        }
     }
 
     // 绑定UI事件
     bindEvents() {
+        document.getElementById('task-workspace').addEventListener('change', () => {
+            if (document.getElementById('task-workspace').value) document.getElementById('project-path').value = '';
+        });
+        document.getElementById('project-path').addEventListener('input', () => {
+            if (document.getElementById('project-path').value.trim()) document.getElementById('task-workspace').value = '';
+        });
         // 停止按钮
         document.getElementById('stop-btn').addEventListener('click', () => {
             if (this.sessionId && this.isProcessing) {
@@ -56,6 +143,7 @@ class App {
         // 清除按钮
         document.getElementById('clear-btn').addEventListener('click', () => {
             this.chatManager.clearMessages();
+            document.getElementById('include-context').checked = false;
         });
 
         // 清除思考记录按钮
@@ -115,24 +203,38 @@ class App {
         document.getElementById('status-indicator').textContent = t('processing_request');
 
         try {
+            const workspace = document.getElementById('task-workspace').value || null;
+            const projectPath = document.getElementById('project-path').value.trim() || null;
+            const normalize = value => String(value || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+            const sameWorkspace = this.sessionWorkspace && (projectPath ?
+                this.sessionWorkspace.project_path && normalize(projectPath) === normalize(this.sessionWorkspace.project_path) :
+                workspace && !this.sessionWorkspace.project_path && workspace === this.sessionWorkspace.workspace);
+            const previousSessionId = document.getElementById('include-context').checked && sameWorkspace ? this.sessionId : null;
             // 发送API请求创建新会话
             const response = await fetch('/api/chat', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ prompt: message }),
+                body: JSON.stringify({ prompt: message, model: document.getElementById('monitor-model')?.value || null,
+                    workspace, project_path: projectPath, previous_session_id: previousSessionId }),
             });
 
             if (!response.ok) {
-                throw new Error(t('api_error', { status: response.status }));
+                const detail = await response.json().catch(() => ({}));
+                throw new Error(detail.detail || t('api_error', { status: response.status }));
             }
 
             const data = await response.json();
             this.sessionId = data.session_id;
+            this.sessionWorkspace = {workspace: data.workspace, project_path: data.project_path};
+            localStorage.setItem('openmanus-session-id', data.session_id);
+            if (data.project_path) this.loadProjectFiles();
+            else { document.getElementById('project-browser').hidden = true; this.loadWorkspaceChoices(data.workspace); }
 
             // 添加用户消息到聊天
             this.chatManager.addUserMessage(message);
+            if (data.context_count) this.chatManager.addSystemMessage(`Included ${data.context_count} previous task exchange(s) from this workspace.`);
 
             // 连接WebSocket
             this.websocketManager.connect(this.sessionId);
@@ -170,6 +272,12 @@ class App {
         // 处理思考步骤
         if (data.thinking_steps && data.thinking_steps.length > 0) {
             this.thinkingManager.addThinkingSteps(data.thinking_steps);
+        }
+        if (data.logs && data.logs.length > 0) {
+            this.thinkingManager.addThinkingSteps(data.logs.map(entry => ({
+                message: String(entry.message ?? ''), type: 'system_log',
+                timestamp: entry.timestamp || Date.now() / 1000
+            })));
         }
 
         // 处理终端输出
@@ -218,12 +326,9 @@ class App {
                 throw new Error(t('api_error', { status: response.status }));
             }
 
-            console.log('处理已停止');
-            this.chatManager.addSystemMessage(t('processing_stopped'));
-            document.getElementById('status-indicator').textContent = t('processing_stopped');
-            document.getElementById('send-btn').disabled = false;
+            this.chatManager.addSystemMessage('Stop requested. Canceling model requests and waiting for any running tool.');
+            document.getElementById('status-indicator').textContent = 'Stopping…';
             document.getElementById('stop-btn').disabled = true;
-            this.isProcessing = false;
 
         } catch (error) {
             console.error(t('stop_processing_error', { message: error.message }), error);
@@ -241,10 +346,38 @@ class App {
 
             const data = await response.json();
             this.workspaceManager.updateWorkspaces(data.workspaces);
+            if (!document.getElementById('project-browser').hidden) this.loadProjectFiles(this.projectDirectory || '');
 
         } catch (error) {
             console.error(t('load_workspace_error', { message: error.message }), error);
         }
+    }
+
+    async loadProjectFiles(path = '') {
+        if (!this.sessionId) return;
+        try {
+            const response = await fetch(`/api/chat/${encodeURIComponent(this.sessionId)}/project-files?path=${encodeURIComponent(path)}`);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            if (!data.entries) { this.fileViewerManager.showFile(data.name, data.content); return; }
+            this.projectDirectory = path;
+            document.getElementById('project-browser').hidden = false;
+            document.getElementById('project-location').textContent = path || '(project root)';
+            const list = document.getElementById('project-files');
+            list.replaceChildren();
+            if (path) {
+                const up = document.createElement('button'); up.textContent = '← Parent folder';
+                up.onclick = () => this.loadProjectFiles(path.split(/[\\/]/).slice(0, -1).join('/'));
+                list.appendChild(up);
+            }
+            for (const entry of data.entries) {
+                const button = document.createElement('button'); button.className = 'file-item';
+                button.textContent = (entry.directory ? '📁 ' : '📄 ') + entry.name;
+                button.onclick = () => this.loadProjectFiles(entry.path);
+                list.appendChild(button);
+            }
+            if (data.truncated) list.append('Showing first 500 entries.');
+        } catch (error) { this.chatManager.addSystemMessage('Could not open project files: ' + error.message); }
     }
 
     // 处理文件点击

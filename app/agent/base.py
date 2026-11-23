@@ -151,8 +151,8 @@ class BaseAgent(BaseModel, ABC):
 
                 results.append(f"Step {self.current_step}: {step_result}")
 
-            if self.current_step >= self.max_steps:
-                results.append(f"Terminated: Reached max steps ({self.max_steps})")
+            if self.current_step >= self.max_steps and self.state != AgentState.FINISHED:
+                raise RuntimeError(f"Task did not finish: reached the {self.max_steps}-step limit. Check the task logs for partial work.")
 
         return "\n".join(results) if results else "No steps executed"
 

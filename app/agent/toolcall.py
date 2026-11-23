@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any, List, Literal
 
@@ -8,6 +9,7 @@ from app.logger import logger
 from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import AgentState, Message, ToolCall
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
+from app.web import agent_monitor
 
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
@@ -29,6 +31,7 @@ class ToolCallAgent(ReActAgent):
     special_tool_names: List[str] = Field(default_factory=lambda: [Terminate().name])
 
     tool_calls: List[ToolCall] = Field(default_factory=list)
+    finish_on_text: bool = False
 
     max_steps: int = 30
 
@@ -105,6 +108,8 @@ class ToolCallAgent(ReActAgent):
                 raise ValueError(TOOL_CALL_REQUIRED)
 
             # Return last message content if no tool calls
+            if self.finish_on_text and self.messages[-1].content:
+                self.state = AgentState.FINISHED
             return self.messages[-1].content or "No content or commands to execute"
 
         results = []
@@ -124,6 +129,22 @@ class ToolCallAgent(ReActAgent):
         return "\n\n".join(results)
 
     async def execute_tool(self, command: ToolCall) -> str:
+        name = command.function.name if command and command.function else 'unknown'
+        arguments = getattr(command.function, 'arguments', None) if command and command.function else None
+        tool = agent_monitor.start_tool(name, arguments)
+        try:
+            result = await self._execute_tool(command)
+        except asyncio.CancelledError:
+            agent_monitor.end_tool(tool, state='canceled')
+            raise
+        except Exception as exc:
+            agent_monitor.end_tool(tool, f'{type(exc).__name__}: {exc}', state='raised')
+            raise
+        else:
+            agent_monitor.end_tool(tool, result=result)
+            return result
+
+    async def _execute_tool(self, command: ToolCall) -> str:
         """Execute a single tool call with robust error handling"""
         if not command or not command.function or not command.function.name:
             return "Error: Invalid command format"

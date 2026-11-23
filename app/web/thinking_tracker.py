@@ -41,7 +41,7 @@ class ThinkingTracker:
     _session_progress: Dict[str, Dict[str, Any]] = {}  # 存储进度信息
     _session_logs: Dict[str, List[Dict]] = {}  # 存储日志内容
     _ws_send_callbacks: Dict[str, Any] = {}  # 存储WebSocket发送回调函数
-    _lock = threading.Lock()
+    _lock = threading.RLock()
 
     @classmethod
     def register_ws_send_callback(cls, session_id: str, callback: Any) -> None:
@@ -63,7 +63,7 @@ class ThinkingTracker:
             cls._session_steps[session_id] = []
             cls._session_status[session_id] = TaskStatus.THINKING
             cls._session_progress[session_id] = {
-                "current_step": "初始化",
+                "current_step": "Initializing",
                 "total_steps": 0,
                 "completed_steps": 0,
                 "percentage": 0,
@@ -112,10 +112,10 @@ class ThinkingTracker:
 
         Args:
             session_id: 会话ID
-            direction: 通信方向，如 "发送到LLM"、"从LLM接收"
+            direction: 通信方向，如 "Sent to LLM"、"Received from LLM"
             content: 通信内容
         """
-        message = f"{direction}通信"
+        message = f"{direction}"
         step = ThinkingStep(message, "communication", content)
         with cls._lock:
             if session_id in cls._session_steps:
@@ -123,7 +123,8 @@ class ThinkingTracker:
 
     @classmethod
     def update_progress(
-        cls, session_id: str, total_steps: int = None, current_step: str = None
+        cls, session_id: str, total_steps: int = None, current_step: str = None,
+        completed_steps: int = None,
     ):
         """更新任务进度信息"""
         with cls._lock:
@@ -135,6 +136,8 @@ class ThinkingTracker:
 
                 if current_step is not None:
                     progress["current_step"] = current_step
+                if completed_steps is not None:
+                    progress["completed_steps"] = completed_steps
 
                 # 重新计算百分比
                 if progress["total_steps"] > 0:
@@ -160,7 +163,7 @@ class ThinkingTracker:
                 if session_id in cls._session_progress:
                     progress = cls._session_progress[session_id]
                     progress["percentage"] = 100
-                    progress["current_step"] = "已完成"
+                    progress["current_step"] = "Completed"
 
     @classmethod
     def add_error(cls, session_id: str, message: str) -> None:
@@ -202,7 +205,7 @@ class ThinkingTracker:
         with cls._lock:
             if session_id not in cls._session_progress:
                 return {
-                    "current_step": "未开始",
+                    "current_step": "Not started",
                     "total_steps": 0,
                     "completed_steps": 0,
                     "percentage": 0,
@@ -243,31 +246,8 @@ class ThinkingTracker:
 
             cls._session_logs[session_id].append(entry)
 
-            # 根据日志级别自动添加对应的思考步骤，更详细地处理日志内容
-            msg = entry.get("message", "")
-            if entry.get("level") == "INFO":
-                # 针对特定类型的日志内容生成更有意义的思考步骤
-                if "开始执行" in msg:
-                    cls.add_thinking_step(
-                        session_id, f"开始执行任务: {msg.replace('开始执行: ', '')}"
-                    )
-                elif "执行步骤" in msg or "步骤" in msg:
-                    # 尝试提取步骤信息
-                    cls.add_thinking_step(session_id, f"执行: {msg}")
-                elif "完成" in msg or "成功" in msg:
-                    cls.add_thinking_step(session_id, f"完成: {msg}")
-                else:
-                    cls.add_thinking_step(session_id, f"信息: {msg}")
-            elif entry.get("level") == "ERROR":
-                cls.add_error(session_id, f"错误: {msg}")
-            elif entry.get("level") == "WARNING":
-                cls.add_thinking_step(session_id, f"警告: {msg}", "warning")
-
-            # 识别进度信息并更新
-            cls._update_progress_from_log(session_id, msg)
-
-        # 添加日志后立即通知 WebSocket 客户端
-        cls._notify_ws_log_update(session_id, entry)
+        # The websocket polls these entries; avoid inferring plan progress from
+        # unrelated agent iteration numbers or sending duplicate log updates.
 
     @classmethod
     def _notify_ws_log_update(cls, session_id: str, log_entry: Dict):
@@ -332,32 +312,32 @@ class ThinkingTracker:
 
 # 预定义的思考步骤模板
 RESEARCH_STEPS = [
-    "分析问题需求和上下文",
-    "确定搜索关键词",
-    "检索相关知识库和资料",
-    "分析和整理检索到的信息",
-    "评估可行的解决方案",
-    "整合信息并构建解决框架",
-    "生成最终回答",
+    "Analyze requirements and context",
+    "Identify search keywords",
+    "Retrieve relevant information",
+    "Analyze and organize findings",
+    "Evaluate possible solutions",
+    "Synthesize a solution",
+    "Generate the final answer",
 ]
 
 CODING_STEPS = [
-    "分析代码需求和功能规格",
-    "设计代码结构和接口",
-    "开发核心算法逻辑",
-    "编写主要功能模块",
-    "实现边界情况和错误处理",
-    "进行代码测试和调试",
-    "优化代码性能和可读性",
-    "完成代码和文档",
+    "Analyze code requirements",
+    "Design code structure and interfaces",
+    "Develop core logic",
+    "Implement main components",
+    "Handle edge cases and errors",
+    "Test and debug the code",
+    "Improve performance and readability",
+    "Finish code and documentation",
 ]
 
 WRITING_STEPS = [
-    "收集写作主题的相关资料...",
-    "构思内容大纲和关键点...",
-    "撰写初稿内容...",
-    "完善论述和事实核查...",
-    "润色语言和格式...",
+    "Gather source material...",
+    "Draft an outline and key points...",
+    "Write the first draft...",
+    "Verify and improve the draft...",
+    "Polish wording and formatting...",
 ]
 
 # 任务类型到预定义步骤的映射
@@ -380,9 +360,9 @@ def generate_thinking_steps(
     # 如果有描述，添加更具体的步骤
     if task_description:
         specific_steps = [
-            f"研究{task_description}的相关信息",
-            f"分析{task_description}的关键点",
-            f"整理{task_description}的解决方案",
+            f"Research information about {task_description}",
+            f"Analyze the key points of {task_description}",
+            f"Organize solutions for {task_description}",
         ]
         steps = specific_steps + steps
 
@@ -393,7 +373,7 @@ def generate_thinking_steps(
 
     # 添加初始步骤
     ThinkingTracker.add_thinking_step(
-        session_id, f"开始处理任务: {task_description if task_description else '新请求'}"
+        session_id, f"Starting task: {task_description if task_description else '新请求'}"
     )
 
     # 模拟每隔一段时间添加一个思考步骤
@@ -403,12 +383,12 @@ def generate_thinking_steps(
         # 模拟与LLM的通信
         if show_communication:
             # 模拟向LLM发送请求
-            ThinkingTracker.add_communication(session_id, "发送到LLM", f"请帮我{step}...")
+            ThinkingTracker.add_communication(session_id, "Sent to LLM", f"Please help me {step}...")
 
             # 模拟接收LLM回复
             ThinkingTracker.add_communication(
-                session_id, "从LLM接收", f"我已完成{step}。这是相关结果: [详细信息]"
+                session_id, "Received from LLM", f"Completed {step}. Results: [details]"
             )
 
     # 添加结论
-    ThinkingTracker.add_conclusion(session_id, "任务处理完成！已生成结果。")
+    ThinkingTracker.add_conclusion(session_id, "Task completed! Results generated.")
