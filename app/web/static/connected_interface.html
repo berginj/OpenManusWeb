@@ -547,7 +547,13 @@
           <div style="margin-bottom:12px"><button id="diagnostics-button" type="button">Prepare troubleshooting report</button> <span id="diagnostics-status" role="status"></span></div>
           <div style="margin-bottom:12px"><label for="diagnostics-search">Find saved tasks:</label> <input id="diagnostics-search" type="search" maxlength="120" placeholder="Task, workspace, or ID"> <button id="diagnostics-refresh" type="button">Refresh list</button> <button id="diagnostics-more" type="button" disabled>Load more</button> <span id="reports-info" role="status"></span></div>
           <div style="margin-bottom:12px"><label for="diagnostics-history">Saved task reports:</label> <select id="diagnostics-history"><option value="">Select a previous task</option></select> <button id="diagnostics-open" type="button">Open report</button> <button id="diagnostics-resume" type="button">Open task in chat</button></div>
-          <div id="diagnostics-panel" hidden style="margin-bottom:12px"><label for="diagnostics-text">Review and edit the report before sharing; it may contain sensitive information.</label><textarea id="diagnostics-text" style="width:100%;height:220px;display:block"></textarea><button id="diagnostics-copy" type="button">Copy report</button> <button id="diagnostics-summary" type="button">Show concise report</button> <button id="diagnostics-full" type="button">Show full data</button></div>
+          <div id="diagnostics-panel" hidden style="margin-bottom:12px">
+            <label for="diagnostics-text">Review and edit the report before sharing; it may contain sensitive information.</label>
+            <textarea id="diagnostics-text" style="width:100%;height:220px;display:block"></textarea>
+            <button id="diagnostics-copy" type="button">Copy report</button> <button id="diagnostics-summary" type="button">Show concise report</button> <button id="diagnostics-full" type="button">Show recorded data</button>
+            <div style="margin-top:8px"><label for="diagnostics-log-query">Find in task log:</label> <input id="diagnostics-log-query" type="text" maxlength="200" placeholder="Leave blank for recent entries"> <button id="diagnostics-log-append" type="button">Append log excerpt</button></div>
+            <small>Searches the current task log and adds up to 60 entries, with context around matches. Rotated log files are not included.</small>
+          </div>
           <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;justify-content:space-between">
             <div><h2 style="margin-bottom:2px">Local inference monitor</h2><small id="monitor-backend">Checking Ollama...</small></div>
             <label style="font-size:14px">Model for next task: <select id="monitor-model" style="padding:7px;margin-left:6px;max-width:280px"></select></label>

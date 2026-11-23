@@ -188,8 +188,11 @@ handoff with the task, progress, usage, result, and recent warnings or errors.
 The handoff also includes excerpts of recent tool inputs and outputs; those can
 contain project data, so edit them before copying if needed.
 When a task or tool raises an error, the handoff includes a bounded traceback
-when available, and **Show full data** retains the longer excerpt.
-**Show full data** includes additional recent events and metrics. Completed reports are saved locally and can be
+when available, and **Show recorded data** retains the longer excerpt.
+Use **Append log excerpt** to add recent log entries or search the selected
+task's current log for a phrase, with neighboring entries for context. The
+excerpt is bounded; rotated log files are not included.
+**Show recorded data** includes additional recent events and metrics. Completed reports are saved locally and can be
 reopened from the report menu. **Open task in chat** restores its workspace,
 saved usage, and available conversation excerpts for a follow-up. Review the contents for private information
 before sharing them. Active tasks are checkpointed approximately every five

@@ -25,13 +25,13 @@
   function conciseReport(report) {
     const cut = (value, max = 2000) => {
       const text = String(value ?? 'Not available');
-      return text.length > max ? text.slice(0, max) + `\n[${text.length - max} characters omitted; see full data]` : text;
+      return text.length > max ? text.slice(0, max) + `\n[${text.length - max} characters omitted; see recorded data]` : text;
     };
     const cutMiddle = (value, max = 1000) => {
       const text = String(value ?? 'Not available');
       if (text.length <= max) return text;
       const half = Math.floor(max / 2);
-      return text.slice(0, half) + `\n[${text.length - max} characters omitted; see full data]\n` + text.slice(-(max - half));
+      return text.slice(0, half) + `\n[${text.length - max} characters omitted; see recorded data]\n` + text.slice(-(max - half));
     };
     const m = report.metrics || {}, p = report.progress || {}, call = m.active_call;
     const lines = ['OpenManus troubleshooting report', `Task ID: ${report.session_id}`,
@@ -61,7 +61,7 @@
     if (report.error_traceback) {
       const trace = String(report.error_traceback);
       lines.push('', `TRACEBACK (${report.error_phase || 'task error'})`,
-        trace.length > 5000 ? '[Earlier traceback omitted; see full data]\n' + trace.slice(-5000) : trace);
+        trace.length > 5000 ? '[Earlier traceback omitted; see recorded data]\n' + trace.slice(-5000) : trace);
     }
     if (report.context_exchanges?.length) {
       lines.push('', 'PREVIOUS CONTEXT INCLUDED', ...report.context_exchanges.map(x =>
@@ -79,13 +79,13 @@
         if (tool.error) lines.push(`  Tool reported error: ${cutMiddle(tool.error, 1000)}`);
         if (tool.error_traceback) {
           const trace = String(tool.error_traceback);
-          lines.push('  Tool traceback:', trace.length > 2500 ? '[Earlier traceback omitted; see full data]\n' + trace.slice(-2500) : trace);
+          lines.push('  Tool traceback:', trace.length > 2500 ? '[Earlier traceback omitted; see recorded data]\n' + trace.slice(-2500) : trace);
         }
       }
     }
     const important = report.important_logs || (report.recent_session_logs || []).filter(l => ['WARNING','ERROR','CRITICAL'].includes(l.level));
     if (important.length) lines.push('', 'WARNINGS AND ERRORS', ...important.slice(-6).map(l => `- ${l.level || 'LOG'}: ${cut(l.message, 1000)}`));
-    lines.push('', 'Review for sensitive information before sharing. Use Show full data for more events and metrics.');
+    lines.push('', 'Review for sensitive information before sharing. Use Show recorded data for more events and metrics.');
     return lines.join('\n');
   }
   function renderHistory(rows) {
@@ -301,6 +301,31 @@
     });
     $('diagnostics-summary').addEventListener('click', () => { if (currentReport) $('diagnostics-text').value = conciseReport(currentReport); });
     $('diagnostics-full').addEventListener('click', () => { if (currentReport) $('diagnostics-text').value = 'OpenManus task diagnostics\n' + JSON.stringify(currentReport, null, 2); });
+    $('diagnostics-log-append').addEventListener('click', async () => {
+      const report = currentReport;
+      if (!report) { $('diagnostics-status').textContent = 'Prepare a task report first.'; return; }
+      const button = $('diagnostics-log-append');
+      button.disabled = true;
+      $('diagnostics-status').textContent = 'Searching the task log...';
+      try {
+        const response = await fetch('/api/chat/' + encodeURIComponent(report.session_id) + '/log-excerpt', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({query: $('diagnostics-log-query').value, limit: 60})
+        });
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          throw new Error(detail.detail || 'HTTP ' + response.status);
+        }
+        const excerpt = await response.json();
+        if (currentReport !== report) { $('diagnostics-status').textContent = 'Report changed; no log excerpt was added.'; return; }
+        if (!excerpt.entries.length) { $('diagnostics-status').textContent = 'No matching entries in the current task log.'; return; }
+        const title = excerpt.query.trim() ? `matches for ${excerpt.query}` : 'recent entries';
+        const header = `\n\nTASK LOG EXCERPT (${title}; ${excerpt.matches} matches, ${excerpt.omitted_entries} earlier entries omitted)\n${excerpt.note}`;
+        $('diagnostics-text').value += header + '\n' + excerpt.entries.map(entry => `${entry.number}: ${entry.text}`).join('\n');
+        $('diagnostics-status').textContent = `Added ${excerpt.entries.length} log entries. Review before copying.`;
+      } catch (e) { $('diagnostics-status').textContent = 'Could not add log excerpt: ' + e.message; }
+      finally { button.disabled = false; }
+    });
     $('diagnostics-copy').addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText($('diagnostics-text').value);

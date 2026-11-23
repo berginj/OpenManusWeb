@@ -24,7 +24,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.config import config
 from app.llm import LLM
 from app.logger import logger
@@ -37,6 +37,7 @@ from app.flow.flow_factory import FlowFactory
 from app.web.log_handler import capture_session_logs, get_logs
 from app.web.log_parser import get_all_logs_info, get_latest_log_info, parse_log_file
 from app.web.thinking_tracker import ThinkingTracker
+from app.web.task_log_excerpt import read_log_excerpt
 
 
 # 控制是否自动打开浏览器 (读取环境变量，默认为True)
@@ -102,6 +103,11 @@ class SessionRequest(BaseModel):
     project_path: str | None = None
     previous_session_id: str | None = None
     execution_mode: Literal['auto', 'direct', 'plan'] = 'auto'
+
+
+class LogExcerptRequest(BaseModel):
+    query: str = Field('', max_length=200)
+    limit: int = Field(60, ge=1, le=100)
 
 
 def runtime_environment():
@@ -372,6 +378,24 @@ async def list_diagnostic_reports(limit: int = Query(50, ge=1, le=100),
     if (before_time is None) != (before_id is None):
         raise HTTPException(status_code=400, detail='Both cursor fields are required')
     return agent_monitor.recent_reports(limit, before_time, before_id, q)
+
+
+@app.post('/api/chat/{session_id}/log-excerpt')
+async def task_log_excerpt(session_id: str, request: LogExcerptRequest):
+    try:
+        if str(uuid.UUID(session_id)) != session_id.lower():
+            raise ValueError('Noncanonical session ID')
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail='Invalid task ID')
+    if session_id not in active_sessions and agent_monitor.load_report(session_id) is None:
+        raise HTTPException(status_code=404, detail='Task not found')
+    log_path = (LOGS_DIR / f'job_{session_id[:8]}.log').resolve()
+    if log_path.parent != LOGS_DIR.resolve() or not log_path.is_file():
+        raise HTTPException(status_code=404, detail='Current task log not found')
+    try:
+        return await asyncio.to_thread(read_log_excerpt, log_path, request.query, request.limit)
+    except OSError:
+        raise HTTPException(status_code=500, detail='Could not read task log')
 
 
 @app.post("/api/chat/{session_id}/stop")
